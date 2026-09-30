@@ -1,6 +1,8 @@
 package check
 
-import ("sync")
+import (
+	"sync"
+)
 
 // History 保存历轮报告；重跑产生新报告，旧报告原样留存。
 type History struct {
@@ -42,4 +44,3 @@ func (h *History) Len() int {
 	defer h.mu.RUnlock()
 	return len(h.reports)
 }
-

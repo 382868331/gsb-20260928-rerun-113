@@ -52,4 +52,3 @@ func (s Status) terminal() bool {
 		return false
 	}
 }
-

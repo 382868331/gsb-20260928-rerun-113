@@ -59,4 +59,3 @@ func (f *FuncCheck) Timeout() time.Duration { return f.Limit }
 func (f *FuncCheck) Run(ctx *Context) Result {
 	return f.Fn(ctx)
 }
-

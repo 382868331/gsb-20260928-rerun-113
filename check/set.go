@@ -83,7 +83,7 @@ func (s *CheckSet) Order() ([]string, error) {
 			indegree[depID]--
 			if indegree[depID] == 0 {
 				ready = append(ready, depID)
-			sort.Strings(ready)
+				sort.Strings(ready)
 			}
 		}
 	}
@@ -92,4 +92,3 @@ func (s *CheckSet) Order() ([]string, error) {
 	}
 	return order, nil
 }
-
