@@ -46,4 +46,3 @@ func (r *Report) Record(id string) (Record, bool) {
 	}
 	return Record{}, false
 }
-

@@ -6,4 +6,3 @@ type Device interface {
 	ID() string
 	Model() string
 }
-

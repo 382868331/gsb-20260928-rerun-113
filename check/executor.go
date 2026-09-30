@@ -3,6 +3,7 @@ package check
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -11,9 +12,9 @@ const DefaultTimeout = 2 * time.Second
 
 // Executor 按依赖关系执行检查集，维护当前结论与历史报告。
 type Executor struct {
-	device Device
-	set    *CheckSet
-	order  []string
+	device  Device
+	set     *CheckSet
+	order   []string
 	history *History
 
 	mu      sync.RWMutex
@@ -45,17 +46,35 @@ func NewExecutor(device Device, set *CheckSet, history *History) (*Executor, err
 
 // RunAll 在给定 ctx 下执行整轮自检；ctx 取消时后续项记为 canceled。
 func (e *Executor) RunAll(ctx context.Context) (*Report, error) {
-	return e.run(ctx, e.order, nil)
+	return e.run(ctx, e.order)
 }
 
-// Rerun 只重跑指定检查及其受影响的后续检查。
-// 与该检查无关的既有结论保持不变；旧报告仍保留在历史中。
-func (e *Executor) Rerun(ctx context.Context, checkID string) (*Report, error) {
-	if _, ok := e.set.Get(checkID); !ok {
-		return nil, fmt.Errorf("检查项 %q 不存在", checkID)
+// Rerun 重跑指定的失败检查及其受影响下游；可一次选择多个失败项。
+// 与所选检查无关的既有结论保持不变；旧报告仍原样保留在历史中。
+func (e *Executor) Rerun(ctx context.Context, checkIDs ...string) (*Report, error) {
+	if len(checkIDs) == 0 {
+		return nil, fmt.Errorf("未指定需要重跑的检查项")
 	}
-	affected := e.descendants(checkID)
-	return e.run(ctx, affected, map[string]bool{checkID: true})
+	roots := map[string]bool{}
+	for _, checkID := range checkIDs {
+		if _, ok := e.set.Get(checkID); !ok {
+			return nil, fmt.Errorf("检查项 %q 不存在", checkID)
+		}
+		roots[checkID] = true
+	}
+	affected := map[string]bool{}
+	for root := range roots {
+		for _, id := range e.descendants(root) {
+			affected[id] = true
+		}
+	}
+	targets := make([]string, 0, len(affected))
+	for _, id := range e.order {
+		if affected[id] {
+			targets = append(targets, id)
+		}
+	}
+	return e.run(ctx, targets)
 }
 
 // descendants 返回包含 root 自身在内、依赖链可达的全部检查项，按执行顺序排列。
@@ -63,7 +82,6 @@ func (e *Executor) descendants(root string) []string {
 	affected := map[string]bool{root: true}
 	queue := []string{root}
 	for len(queue) > 0 {
-		cur := queue[0]
 		queue = queue[1:]
 		for _, id := range e.order {
 			if affected[id] {
@@ -88,14 +106,12 @@ func (e *Executor) descendants(root string) []string {
 	return out
 }
 
-func (e *Executor) run(parent context.Context, targets []string, roots map[string]bool) (*Report, error) {
+func (e *Executor) run(parent context.Context, targets []string) (*Report, error) {
 	target := map[string]bool{}
 	for _, id := range targets {
 		target[id] = true
 	}
 	started := time.Now()
-	newRecords := make([]Record, 0, len(targets))
-
 	for _, id := range e.order {
 		if !target[id] {
 			continue
@@ -112,19 +128,22 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		if err := parent.Err(); err != nil {
 			rec.EndedAt = time.Now()
 			rec.Status, rec.Code, rec.Message = fromContextErr(err)
-			e.store(rec, roots[id])
-			newRecords = append(newRecords, rec)
+			e.store(rec)
 			continue
 		}
 
-		// 2) 前置条件：任一前置非通过（失败/故障/阻塞/超时/取消）则无法执行。
+		// 2) 前置条件：任一前置未通过（失败/故障/阻塞/超时/取消/未执行）则不得执行，
+		//    也绝不能按通过处理。
 		if blocked, why := e.blockedBy(item.Deps()); blocked != "" {
 			rec.EndedAt = time.Now()
 			rec.Status = Blocked
-			rec.Code = "upstream_not_passed"
+			if why.code == "upstream_not_run" {
+				rec.Code = "upstream_not_run"
+			} else {
+				rec.Code = "upstream_not_passed"
+			}
 			rec.Message = fmt.Sprintf("前置检查 %q 状态为 %s：%s", blocked, why.status, why.message)
-			e.store(rec, roots[id])
-			newRecords = append(newRecords, rec)
+			e.store(rec)
 			continue
 		}
 
@@ -135,8 +154,26 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		}
 		itemCtx, cancelItem := context.WithTimeout(parent, limit)
 		resCh := make(chan Result, 1)
+		var runners sync.WaitGroup
+		runners.Add(1)
 		go func() {
-			resCh <- item.Run(&Context{Context: itemCtx, Device: e.device})
+			defer runners.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					select {
+					case resCh <- Result{
+						Status:  Error,
+						Code:    "check_panic",
+						Message: fmt.Sprintf("检查执行崩溃: %v", recovered),
+					}:
+					case <-itemCtx.Done():
+					}
+				}
+			}()
+			select {
+			case resCh <- item.Run(&Context{Context: itemCtx, Device: e.device}):
+			case <-itemCtx.Done():
+			}
 		}()
 
 		select {
@@ -147,17 +184,24 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 			rec.Message = res.Message
 		case <-itemCtx.Done():
 			rec.EndedAt = time.Now()
-			rec.Status, rec.Code, rec.Message = fromContextErr(itemCtx.Err())
+			if parent.Err() != nil {
+				rec.Status, rec.Code, rec.Message = fromContextErr(parent.Err())
+			} else {
+				rec.Status, rec.Code, rec.Message = fromContextErr(itemCtx.Err())
+			}
 		}
 		cancelItem()
-		e.store(rec, roots[id])
-		newRecords = append(newRecords, rec)
+		runners.Wait()
+		e.store(rec)
 	}
 
 	e.mu.RLock()
 	all := make([]Record, 0, len(e.order))
 	for _, id := range e.order {
 		if rec, ok := e.records[id]; ok {
+			if rec.Deps == nil {
+				rec.Deps = []string{}
+			}
 			all = append(all, rec)
 		}
 	}
@@ -169,14 +213,16 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		StartedAt: started,
 		EndedAt:   time.Now(),
 		Overall:   overall(all, len(e.order)),
-		Records:   all,
+		Records:   append([]Record(nil), all...),
 	}
+	report.Records = report.Records[:len(all):len(all)]
 	e.history.Save(report)
 	return report, nil
 }
 
 type upstreamInfo struct {
 	status  Status
+	code    string
 	message string
 }
 
@@ -187,25 +233,21 @@ func (e *Executor) blockedBy(deps []string) (string, upstreamInfo) {
 	for _, dep := range deps {
 		rec, ok := e.records[dep]
 		if !ok {
-			return dep, upstreamInfo{status: Status("missing"), message: "前置尚未执行"}
+			return dep, upstreamInfo{status: Status("missing"), code: "upstream_not_run", message: "前置尚未执行"}
 		}
 		if rec.Status != Passed {
-			return dep, upstreamInfo{status: rec.Status, message: rec.Message}
+			return dep, upstreamInfo{status: rec.Status, code: "upstream_not_passed", message: rec.Message}
 		}
 	}
 	return "", upstreamInfo{}
 }
 
-func (e *Executor) store(rec Record, isRoot bool) {
+func (e *Executor) store(rec Record) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if isRoot {
-		e.attempt[rec.CheckID]++
-	}
+	e.attempt[rec.CheckID]++
 	rec.Attempt = e.attempt[rec.CheckID]
-	if rec.Attempt == 0 {
-		rec.Attempt = 1
-	}
+	rec.Deps = append([]string(nil), rec.Deps...)
 	e.records[rec.CheckID] = rec
 }
 
@@ -218,7 +260,7 @@ func fromContextErr(err error) (Status, string, string) {
 
 // overall 汇总当前全部检查项结论；未执行项记为阻塞。
 func overall(records []Record, total int) Status {
-		if len(records) == 0 {
+	if len(records) == 0 {
 		return Blocked
 	}
 	worst := Passed
@@ -236,3 +278,23 @@ func overall(records []Record, total int) Status {
 // History 返回执行器使用的历史存储。
 func (e *Executor) History() *History { return e.history }
 
+// Restore 用既往报告恢复执行器当前结论（例如跨进程重跑前）。
+// 只载入属于当前检查集的记录；历史报告本身不被修改。
+func (e *Executor) Restore(report *Report) error {
+	if report == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, rec := range report.Records {
+		if _, ok := e.set.Get(rec.CheckID); !ok {
+			continue
+		}
+		rec.Deps = append([]string(nil), rec.Deps...)
+		e.records[rec.CheckID] = rec
+		if rec.Attempt > e.attempt[rec.CheckID] {
+			e.attempt[rec.CheckID] = rec.Attempt
+		}
+	}
+	return nil
+}

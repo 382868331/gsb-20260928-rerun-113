@@ -1,6 +1,8 @@
 package check
 
-import ("sync")
+import (
+	"sync"
+)
 
 // History 保存历轮报告；重跑产生新报告，旧报告原样留存。
 type History struct {
@@ -26,6 +28,15 @@ func (h *History) Latest() (*Report, bool) {
 	return h.reports[len(h.reports)-1], true
 }
 
+// All 返回历轮报告的只读顺序快照（最早在前）。
+func (h *History) All() []*Report {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]*Report, len(h.reports))
+	copy(out, h.reports)
+	return out
+}
+
 // Get 按轮次编号（从 1 开始）取报告。
 func (h *History) Get(runID int) (*Report, bool) {
 	h.mu.RLock()
@@ -42,4 +53,3 @@ func (h *History) Len() int {
 	defer h.mu.RUnlock()
 	return len(h.reports)
 }
-
