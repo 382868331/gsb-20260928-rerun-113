@@ -12,6 +12,9 @@
 //	slow     温度传感器慢响应：首轮 temperature=timeout、calibration=blocked；
 //	         整轮可被 Ctrl-C 取消（演示 canceled 与资源收尾）；恢复后只重跑
 //	         temperature 及其下游，power 的前次通过结论保留。
+//	stuck    温度传感器对取消无响应：检查按 timeout 落结论，但在途读取尚未收回，
+//	         报告如实标记 cleanup=pending；无关设备照常自检；恢复后重跑同一
+//	         检查会先等旧读取收回，绝不与旧读取重叠，迟到结果也不会写回记录。
 //	range    温度读数越界（failed/out_of_range）与传感器恢复正常读数的对比，
 //	         演示“读数越界”与“传感器不存在/检查报错”是不同结论。
 //	all      依次演示上述场景。
@@ -30,7 +33,7 @@ import (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|range|all]")
+		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|all]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -43,14 +46,17 @@ func main() {
 		runMissing()
 	case "slow":
 		runSlow()
+	case "stuck":
+		runStuck()
 	case "range":
 		runRange()
 	case "all":
 		runMissing()
 		runSlow()
+		runStuck()
 		runRange()
 	default:
-		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|range|all）\n", scene)
+		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|all）\n", scene)
 		os.Exit(2)
 	}
 }
@@ -58,13 +64,20 @@ func main() {
 // printReport 以表格打印一轮报告，并给出各状态计数。
 func printReport(title string, r *check.Report) {
 	fmt.Printf("\n=== %s（批次 #%d，整体 %s）===\n", title, r.RunID, r.Overall)
-	fmt.Printf("%-14s %-9s %-20s %-9s %s\n", "检查项", "状态", "代码", "次数", "说明")
+	fmt.Printf("%-14s %-9s %-20s %-6s %-6s %s\n", "检查项", "状态", "代码", "次数", "收尾", "说明")
 	for _, rec := range r.Records {
-		fmt.Printf("%-14s %-9s %-20s %-9d %s\n", rec.CheckID, rec.Status, rec.Code, rec.Attempt, rec.Message)
+		cleanup := "已收尾"
+		if rec.Cleanup == check.CleanupPending {
+			cleanup = "在途"
+		}
+		fmt.Printf("%-14s %-9s %-20s %-6d %-6s %s\n", rec.CheckID, rec.Status, rec.Code, rec.Attempt, cleanup, rec.Message)
 	}
 	c := r.Counts()
 	fmt.Printf("计数: passed=%d failed=%d error=%d blocked=%d timeout=%d canceled=%d\n",
 		c[check.Passed], c[check.Failed], c[check.Error], c[check.Blocked], c[check.Timeout], c[check.Canceled])
+	if pending := r.PendingCleanup(); len(pending) > 0 {
+		fmt.Printf("注意: %v 结论已出但设备操作尚未收回，不能视为完全结束\n", pending)
+	}
 }
 
 func printHistory(h *check.History) {
@@ -138,6 +151,9 @@ func runSlow() {
 	r1, err := exec.RunAll(context.Background())
 	must(err)
 	printReport("首轮：temperature 慢响应超时", r1)
+	// 结论与收尾分离：先看清理进展，等旧在途读取收回后再断言资源。
+	fmt.Printf("清理进展: 未收回=%v\n", exec.PendingCleanup())
+	must(exec.WaitCleanup(context.Background()))
 	must(dev.Close()) // 关键：超时后传感器句柄必须全部释放，无在途读取
 	must(assertStatus(r1, "power", check.Passed, "ok"))
 	must(assertStatus(r1, "temperature", check.Timeout, "timeout"))
@@ -157,6 +173,7 @@ func runSlow() {
 	r2, err := exec.RunAll(ctx)
 	must(err)
 	printReport("取消轮：开始 100ms 后外部取消", r2)
+	must(exec.WaitCleanup(context.Background()))
 	must(dev.Close())
 	must(assertStatus(r2, "temperature", check.Canceled, "canceled"))
 	must(assertStatus(r2, "calibration", check.Canceled, "canceled"))
@@ -182,6 +199,70 @@ func runSlow() {
 	tempRecord, _ := r3.Record("temperature")
 	if tempRecord.Attempt != 3 {
 		must(fmt.Errorf("temperature 应已执行 3 次，实际 %d", tempRecord.Attempt))
+	}
+	printHistory(exec.History())
+}
+
+// 场景四：设备对取消无响应——结论与资源收尾分离，重跑不与旧读取重叠。
+func runStuck() {
+	fmt.Println("\n########## 场景 stuck：读取取消无响应 + 清理进展 + 重跑不重叠 ##########")
+	power := virtual.NewSensor("power", 12.0, 11.0, 13.0)
+	temp := virtual.NewSensor("temp", 25.0, 10.0, 40.0)
+	calib := virtual.NewSensor("calib", 0.2, 0.0, 1.0)
+	temp.SetDelay(1500 * time.Millisecond) // 远大于检查项 500ms 时限
+	temp.SetIgnoreCancel(true)             // 设备无响应：取消/超时打不断这次读取
+	dev := virtual.NewDeviceWithSensors("dev-stuck", power, temp, calib)
+
+	exec, _ := newExecutor(dev)
+	r1, err := exec.RunAll(context.Background())
+	must(err)
+	printReport("首轮：temperature 超时，但旧读取仍在途", r1)
+	must(assertStatus(r1, "temperature", check.Timeout, "timeout"))
+	must(assertStatus(r1, "calibration", check.Blocked, "upstream_not_passed"))
+	tempRec, _ := r1.Record("temperature")
+	if tempRec.Cleanup != check.CleanupPending {
+		must(fmt.Errorf("temperature 资源尚未收回，应标记 cleanup=pending，实际 %s", tempRec.Cleanup))
+	}
+	fmt.Printf("清理进展: 未收回=%v（结论已出，资源仍在回收）\n", exec.PendingCleanup())
+	// 真实资源状态：在途读取未收回前，设备不能视为可关闭。
+	if err := dev.Close(); err != nil {
+		fmt.Println("设备关闭校验（符合预期，资源未收尾）:", err)
+	} else {
+		must(fmt.Errorf("在途读取未收回时不应关闭成功"))
+	}
+
+	// 无关设备不受无响应设备拖累，照常完成自检。
+	okDev := virtual.NewDeviceWithSensors("dev-ok",
+		virtual.NewSensor("power", 12.0, 11.0, 13.0),
+		virtual.NewSensor("temp", 25.0, 10.0, 40.0),
+		virtual.NewSensor("calib", 0.2, 0.0, 1.0))
+	okExec, _ := newExecutor(okDev)
+	rOK, err := okExec.RunAll(context.Background())
+	must(err)
+	printReport("并行：无关设备 dev-ok 照常自检", rOK)
+	must(assertStatus(rOK, "temperature", check.Passed, "ok"))
+	must(okDev.Close())
+
+	// 恢复设备并重跑：执行器先等旧在途读取收回，再发起新读取，二者绝不重叠；
+	// 旧读取的迟到结果会被丢弃，不会写回任何记录。
+	temp.SetIgnoreCancel(false)
+	temp.SetDelay(0)
+	fmt.Println("重跑 temperature：先等待旧在途读取收回（避免与旧读取重叠）…")
+	r2, err := exec.Rerun(context.Background(), virtual.CheckTemp)
+	must(err)
+	printReport("重跑：旧读取收回后 temperature 恢复通过", r2)
+	must(assertStatus(r2, "temperature", check.Passed, "ok"))
+	must(assertStatus(r2, "calibration", check.Passed, "ok"))
+	must(exec.WaitCleanup(context.Background()))
+	if pending := exec.PendingCleanup(); len(pending) != 0 {
+		must(fmt.Errorf("重跑后仍有未收回操作: %v", pending))
+	}
+	must(dev.Close())
+	reads, opened, closed := temp.Stats()
+	fmt.Printf("temperature 资源账本: 读取=%d 打开=%d 关闭=%d（旧新两次读取均已配对收回）\n",
+		reads, opened, closed)
+	if opened != closed || reads != 2 {
+		must(fmt.Errorf("资源账本不符: reads=%d open=%d close=%d", reads, opened, closed))
 	}
 	printHistory(exec.History())
 }

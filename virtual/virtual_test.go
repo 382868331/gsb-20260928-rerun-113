@@ -169,6 +169,9 @@ func TestSlowSensorTimeoutReleasesResources(t *testing.T) {
 	}
 	assertRec(t, r, "temperature", check.Timeout, "timeout")
 	assertRec(t, r, "calibration", check.Blocked, "upstream_not_passed")
+	if err := exec.WaitCleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if n := temp.InFlight(); n != 0 {
 		t.Fatalf("超时后仍有 %d 次在途读取，资源未收尾", n)
 	}
@@ -216,9 +219,10 @@ func TestCancelStopsAndCleansUp(t *testing.T) {
 	}
 	assertRec(t, r, "temperature", check.Canceled, "canceled")
 	assertRec(t, r, "calibration", check.Canceled, "canceled")
-	deadline := time.Now().Add(2 * time.Second)
-	for temp.InFlight() != 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	wctx, wcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer wcancel()
+	if err := exec.WaitCleanup(wctx); err != nil {
+		t.Fatalf("等待在途读取收尾失败: %v", err)
 	}
 	if temp.InFlight() != 0 {
 		t.Fatal("取消后在途读取未退出")
@@ -242,6 +246,101 @@ func TestRerunDownstreamStillBlocked(t *testing.T) {
 	}
 	assertRec(t, r, "calibration", check.Blocked, "upstream_not_passed")
 	if err := dev.Close(); err != nil {
+	}
+}
+
+// 取消无响应的慢传感器：结论（timeout）与资源收尾（cleanup）分离。
+// 在途读取未收回前不得视为完全结束；重跑必须先收回旧读取，迟到结果不得污染记录。
+func TestStuckSensorCleanupBoundary(t *testing.T) {
+	power := virtual.NewSensor("power", 12, 11, 13)
+	temp := virtual.NewSensor("temp", 25, 10, 40)
+	temp.SetDelay(1200 * time.Millisecond)
+	temp.SetIgnoreCancel(true) // 设备无响应：取消/超时打不断这次读取
+	calib := virtual.NewSensor("calib", .2, 0, 1)
+	dev := healthyDevice("d-stuck", power, temp, calib)
+	exec := buildExec(t, dev, nil)
+
+	start := time.Now()
+	r1, err := exec.RunAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatal("无响应设备不应拖住整轮自检")
+	}
+	assertRec(t, r1, "temperature", check.Timeout, "timeout")
+	assertRec(t, r1, "calibration", check.Blocked, "upstream_not_passed")
+
+	// 结论已出，但资源尚未收回：报告必须如实标记，不得声称完全结束。
+	rec, _ := r1.Record("temperature")
+	if rec.Cleanup != check.CleanupPending {
+		t.Fatalf("temperature 应标记 cleanup=pending，实际 %s", rec.Cleanup)
+	}
+	if r1.FullySettled() {
+		t.Fatal("存在在途读取时报告不应视为完全收尾")
+	}
+	if pending := exec.PendingCleanup(); len(pending) != 1 || pending[0] != "temperature" {
+		t.Fatalf("未收回列表期望 [temperature]，得到 %v", pending)
+	}
+	if err := dev.Close(); err == nil {
+		t.Fatal("在途读取未收回时设备关闭应报错")
+	}
+
+	// 无关设备不受拖累，照常完成自检并收尾。
+	devOK := healthyDevice("d-ok", nil, nil, nil)
+	execOK := buildExec(t, devOK, nil)
+	rOK, err := execOK.RunAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, rOK, "temperature", check.Passed, "ok")
+	if err := devOK.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 恢复后重跑同一检查：执行器先等旧读取收回（不重叠），再发起新读取。
+	temp.SetIgnoreCancel(false)
+	temp.SetDelay(0)
+	r2, err := exec.Rerun(context.Background(), virtual.CheckTemp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, r2, "temperature", check.Passed, "ok")
+	assertRec(t, r2, "calibration", check.Passed, "ok")
+	rec2, _ := r2.Record("temperature")
+	if rec2.Cleanup != check.CleanupDone {
+		t.Fatalf("重跑后 temperature 应已收尾，实际 %s", rec2.Cleanup)
+	}
+	if rec2.Attempt != 2 {
+		t.Fatalf("temperature 应执行 2 次，Attempt=%d", rec2.Attempt)
+	}
+	if err := exec.WaitCleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if pending := exec.PendingCleanup(); len(pending) != 0 {
+		t.Fatalf("重跑后仍有未收回操作: %v", pending)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 迟到结果不污染后续自检：旧读取只计入资源账本，不产生额外记录。
+	reads, opened, closed := temp.Stats()
+	if reads != 2 || opened != 2 || closed != 2 {
+		t.Fatalf("资源账本期望 reads=2 open=2 close=2，得到 %d/%d/%d", reads, opened, closed)
+	}
+	// 历史独立：首轮仍是 timeout+pending，重跑轮是 passed，两批互不改写。
+	if exec.History().Len() != 2 {
+		t.Fatalf("历史轮数期望 2，得到 %d", exec.History().Len())
+	}
+	old, ok := exec.History().Get(1)
+	if !ok {
+		t.Fatal("第 1 轮历史丢失")
+	}
+	assertRec(t, old, "temperature", check.Timeout, "timeout")
+	oldRec, _ := old.Record("temperature")
+	if oldRec.Cleanup != check.CleanupPending {
+		t.Fatalf("历史批次应保留 cleanup=pending 的真实状态，实际 %s", oldRec.Cleanup)
 	}
 }
 

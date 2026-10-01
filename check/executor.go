@@ -3,6 +3,7 @@ package check
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -21,6 +22,9 @@ type Executor struct {
 	mu      sync.RWMutex
 	records map[string]Record
 	attempt map[string]int
+	// inflight 记录每个检查项尚未收回的在途操作（超时/取消后仍未返回的旧读取）。
+	// 结论与资源收尾分离：报告可已出具，但只要 inflight 非空就不能算完全结束。
+	inflight map[string]chan struct{}
 }
 
 // NewExecutor 为某台设备及其型号检查集构建执行器。
@@ -50,7 +54,84 @@ func NewExecutor(device Device, set *CheckSet, history *History) (*Executor, err
 		history:    history,
 		records:    map[string]Record{},
 		attempt:    map[string]int{},
+		inflight:   map[string]chan struct{}{},
 	}, nil
+}
+
+// PendingCleanup 返回结论已出但设备操作尚未收回（在途）的检查项，按 ID 排序。
+func (e *Executor) PendingCleanup() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	ids := make([]string, 0, len(e.inflight))
+	for id := range e.inflight {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// WaitCleanup 阻塞等待全部在途操作收回；ctx 结束时返回其错误。
+// 调用方在关闭设备、断言资源前应先等待，避免把未收回的操作当成已结束。
+func (e *Executor) WaitCleanup(ctx context.Context) error {
+	for {
+		e.mu.RLock()
+		var dones []<-chan struct{}
+		for _, ch := range e.inflight {
+			dones = append(dones, ch)
+		}
+		e.mu.RUnlock()
+		if len(dones) == 0 {
+			return nil
+		}
+		select {
+		case <-dones[0]:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// cleanupState 返回某检查项当前的资源收尾状态。
+func (e *Executor) cleanupState(id string) CleanupState {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if _, ok := e.inflight[id]; ok {
+		return CleanupPending
+	}
+	return CleanupDone
+}
+
+// trackStart 登记一个在途操作。
+func (e *Executor) trackStart(id string, done chan struct{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.inflight[id] = done
+}
+
+// trackDone 注销在途操作；仅当仍是同一代操作时才移除，避免误删新操作。
+func (e *Executor) trackDone(id string, done chan struct{}) {
+	e.mu.Lock()
+	if cur, ok := e.inflight[id]; ok && cur == done {
+		delete(e.inflight, id)
+	}
+	e.mu.Unlock()
+	close(done)
+}
+
+// waitInflight 等待同一检查项的旧在途操作收回，保证重跑不与旧读取重叠。
+func (e *Executor) waitInflight(ctx context.Context, id string) error {
+	e.mu.RLock()
+	done := e.inflight[id]
+	e.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // RunAll 在给定 ctx 下执行整轮自检；ctx 取消时后续项记为 canceled。
@@ -123,6 +204,7 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		if err := parent.Err(); err != nil {
 			rec.EndedAt = time.Now()
 			rec.Status, rec.Code, rec.Message = fromContextErr(err)
+			rec.Cleanup = e.cleanupState(id)
 			e.store(rec, roots[id])
 			newRecords = append(newRecords, rec)
 			continue
@@ -134,19 +216,33 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 			rec.Status = Blocked
 			rec.Code = "upstream_not_passed"
 			rec.Message = fmt.Sprintf("前置检查 %q 状态为 %s：%s", blocked, why.status, why.message)
+			rec.Cleanup = e.cleanupState(id)
 			e.store(rec, roots[id])
 			newRecords = append(newRecords, rec)
 			continue
 		}
 
-		// 3) 单项超时与取消由独立 ctx 区分。
+		// 3) 同一检查项的旧在途操作必须先收回，重跑不得与旧读取重叠。
+		if err := e.waitInflight(parent, id); err != nil {
+			rec.EndedAt = time.Now()
+			rec.Status, rec.Code, rec.Message = fromContextErr(err)
+			rec.Cleanup = e.cleanupState(id)
+			e.store(rec, roots[id])
+			newRecords = append(newRecords, rec)
+			continue
+		}
+
+		// 4) 单项超时与取消由独立 ctx 区分。
 		limit := item.Timeout()
 		if limit <= 0 {
 			limit = DefaultTimeout
 		}
 		itemCtx, cancelItem := context.WithTimeout(parent, limit)
 		resCh := make(chan Result, 1)
+		done := make(chan struct{})
+		e.trackStart(id, done)
 		go func() {
+			defer e.trackDone(id, done)
 			defer func() {
 				if r := recover(); r != nil {
 					resCh <- Fault("check_panic", "检查自身异常: %v", r)
@@ -158,6 +254,8 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		select {
 		case res := <-resCh:
 			// 超时/取消与检查返回可能同时发生，以上游 ctx 结论为准，避免误判通过。
+			// 检查函数已返回，其设备操作随之结束，资源视为已收尾。
+			rec.Cleanup = CleanupDone
 			if err := itemCtx.Err(); err != nil {
 				rec.Status, rec.Code, rec.Message = fromContextErr(err)
 				break
@@ -167,8 +265,11 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 			rec.Code = res.Code
 			rec.Message = res.Message
 		case <-itemCtx.Done():
+			// 结论落定，但检查 goroutine 可能仍在运行（如设备对取消无响应）。
+			// 如实记录收尾状态；其迟到结果只会进入缓冲通道并被丢弃，不会写回记录。
 			rec.EndedAt = time.Now()
 			rec.Status, rec.Code, rec.Message = fromContextErr(itemCtx.Err())
+			rec.Cleanup = e.cleanupState(id)
 		}
 		cancelItem()
 		e.store(rec, roots[id])

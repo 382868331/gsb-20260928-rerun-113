@@ -5,6 +5,8 @@
 //   - 读取报错：Read 返回 ErrSensorFault（检查自身无法完成，记为 error/read_error）；
 //   - 读数越界：Read 正常返回但数值超出检查阈值（业务不达标，记为 failed/out_of_range）；
 //   - 慢响应：Read 超过 ctx 时限，或在 ctx 取消后及时退出（timeout/canceled）。
+//   - 取消无响应：SetIgnoreCancel 后 Read 无视 ctx，直到自身延迟结束才返回，
+//     用于演练“结论已出、资源尚未收回”的收尾边界。
 package virtual
 
 import (
@@ -29,6 +31,7 @@ type Sensor struct {
 	mu       sync.Mutex
 	missing  bool
 	fault    bool
+	stubborn bool
 	value    float64
 	min, max float64 // 该传感器的物理量合理范围，仅用于演示参考
 	delay    time.Duration
@@ -59,6 +62,14 @@ func (s *Sensor) SetDelay(d time.Duration) { s.mu.Lock(); s.delay = d; s.mu.Unlo
 // InFlight 返回当前尚未返回的读取调用数，用于断言资源已收尾。
 func (s *Sensor) InFlight() int { return int(atomic.LoadInt32(&s.inFlight)) }
 
+// SetIgnoreCancel 模拟对取消/超时无响应的设备：Read 不监听 ctx，
+// 直到自身延迟耗尽才返回。调用方无法打断，只能等待其收尾。
+func (s *Sensor) SetIgnoreCancel(ignore bool) {
+	s.mu.Lock()
+	s.stubborn = ignore
+	s.mu.Unlock()
+}
+
 // Stats 返回累计读取次数与打开/关闭（获取/释放）次数。
 func (s *Sensor) Stats() (reads int64, opened int64, closed int64) {
 	s.mu.Lock()
@@ -66,10 +77,10 @@ func (s *Sensor) Stats() (reads int64, opened int64, closed int64) {
 	return s.total, s.opened, s.closed
 }
 
-func (s *Sensor) snapshot() (missing, fault bool, value float64, delay time.Duration) {
+func (s *Sensor) snapshot() (missing, fault, stubborn bool, value float64, delay time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.missing, s.fault, s.value, s.delay
+	return s.missing, s.fault, s.stubborn, s.value, s.delay
 }
 
 // acquire 模拟获取传感器句柄（串口/通道），与 release 配对统计收尾。
@@ -98,20 +109,25 @@ func (s *Sensor) Read(ctx context.Context) (float64, error) {
 	s.total++
 	s.mu.Unlock()
 
-	missing, fault, value, delay := s.snapshot()
+	missing, fault, stubborn, value, delay := s.snapshot()
 	if missing {
 		return 0, fmt.Errorf("%w: %s", ErrSensorMissing, s.name)
 	}
 	if delay > 0 {
 		t := time.NewTimer(delay)
 		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-t.C:
+		if stubborn {
+			// 无响应设备：取消/超时都打断不了，只能等它自己返回。
+			<-t.C
+		} else {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-t.C:
+			}
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil && !stubborn {
 		return 0, err
 	}
 	if fault {
