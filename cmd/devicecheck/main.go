@@ -12,6 +12,9 @@
 //	slow     温度传感器慢响应：首轮 temperature=timeout、calibration=blocked；
 //	         整轮可被 Ctrl-C 取消（演示 canceled 与资源收尾）；恢复后只重跑
 //	         temperature 及其下游，power 的前次通过结论保留。
+//	stuck    温度读取对取消无响应：超时结论先行给出并标记 CleanupPending，
+//	         清理进展通过 InFlight 单独展示；无关设备照常自检；同一设备
+//	         重跑会等待旧读取收尾，不与在途读取重叠。
 //	range    温度读数越界（failed/out_of_range）与传感器恢复正常读数的对比，
 //	         演示“读数越界”与“传感器不存在/检查报错”是不同结论。
 //	all      依次演示上述场景。
@@ -30,7 +33,7 @@ import (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|range|all]")
+		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|all]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -43,14 +46,17 @@ func main() {
 		runMissing()
 	case "slow":
 		runSlow()
+	case "stuck":
+		runStuck()
 	case "range":
 		runRange()
 	case "all":
 		runMissing()
 		runSlow()
+		runStuck()
 		runRange()
 	default:
-		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|range|all）\n", scene)
+		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|all）\n", scene)
 		os.Exit(2)
 	}
 }
@@ -60,11 +66,18 @@ func printReport(title string, r *check.Report) {
 	fmt.Printf("\n=== %s（批次 #%d，整体 %s）===\n", title, r.RunID, r.Overall)
 	fmt.Printf("%-14s %-9s %-20s %-9s %s\n", "检查项", "状态", "代码", "次数", "说明")
 	for _, rec := range r.Records {
-		fmt.Printf("%-14s %-9s %-20s %-9d %s\n", rec.CheckID, rec.Status, rec.Code, rec.Attempt, rec.Message)
+		line := fmt.Sprintf("%-14s %-9s %-20s %-9d %s", rec.CheckID, rec.Status, rec.Code, rec.Attempt, rec.Message)
+		if rec.CleanupPending {
+			line += " [资源收尾中]"
+		}
+		fmt.Println(line)
 	}
 	c := r.Counts()
 	fmt.Printf("计数: passed=%d failed=%d error=%d blocked=%d timeout=%d canceled=%d\n",
 		c[check.Passed], c[check.Failed], c[check.Error], c[check.Blocked], c[check.Timeout], c[check.Canceled])
+	if ids := r.PendingCleanup(); len(ids) > 0 {
+		fmt.Printf("注意：%v 结论已出但读取尚未收回，资源收尾仍在进行\n", ids)
+	}
 }
 
 func printHistory(h *check.History) {
@@ -138,7 +151,8 @@ func runSlow() {
 	r1, err := exec.RunAll(context.Background())
 	must(err)
 	printReport("首轮：temperature 慢响应超时", r1)
-	must(dev.Close()) // 关键：超时后传感器句柄必须全部释放，无在途读取
+	must(exec.WaitIdle(context.Background())) // 明确边界：先等收尾，再断言资源已释放
+	must(dev.Close())                         // 关键：超时后传感器句柄必须全部释放，无在途读取
 	must(assertStatus(r1, "power", check.Passed, "ok"))
 	must(assertStatus(r1, "temperature", check.Timeout, "timeout"))
 	must(assertStatus(r1, "calibration", check.Blocked, "upstream_not_passed"))
@@ -157,6 +171,7 @@ func runSlow() {
 	r2, err := exec.RunAll(ctx)
 	must(err)
 	printReport("取消轮：开始 100ms 后外部取消", r2)
+	must(exec.WaitIdle(context.Background()))
 	must(dev.Close())
 	must(assertStatus(r2, "temperature", check.Canceled, "canceled"))
 	must(assertStatus(r2, "calibration", check.Canceled, "canceled"))

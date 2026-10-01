@@ -5,6 +5,8 @@
 //   - 读取报错：Read 返回 ErrSensorFault（检查自身无法完成，记为 error/read_error）；
 //   - 读数越界：Read 正常返回但数值超出检查阈值（业务不达标，记为 failed/out_of_range）；
 //   - 慢响应：Read 超过 ctx 时限，或在 ctx 取消后及时退出（timeout/canceled）。
+//   - 取消无响应：SetIgnoreContext(true) 后 Read 不理会 ctx，直到延迟自然结束，
+//     用于演练“超时结论已出但资源尚未收回”的收尾边界。
 package virtual
 
 import (
@@ -26,16 +28,17 @@ var ErrSensorFault = errors.New("sensor fault")
 type Sensor struct {
 	name string
 
-	mu       sync.Mutex
-	missing  bool
-	fault    bool
-	value    float64
-	min, max float64 // 该传感器的物理量合理范围，仅用于演示参考
-	delay    time.Duration
-	inFlight int32
-	total    int64
-	opened   int64
-	closed   int64
+	mu        sync.Mutex
+	missing   bool
+	fault     bool
+	ignoreCtx bool
+	value     float64
+	min, max  float64 // 该传感器的物理量合理范围，仅用于演示参考
+	delay     time.Duration
+	inFlight  int32
+	total     int64
+	opened    int64
+	closed    int64
 }
 
 // NewSensor 构造一个正常读数的虚拟传感器。
@@ -56,6 +59,10 @@ func (s *Sensor) SetValue(v float64) { s.mu.Lock(); s.value = v; s.mu.Unlock() }
 // 用于模拟慢响应；ctx 取消/超时后 Read 立即返回 ctx.Err()，不泄漏 goroutine。
 func (s *Sensor) SetDelay(d time.Duration) { s.mu.Lock(); s.delay = d; s.mu.Unlock() }
 
+// SetIgnoreContext 模拟“取消无响应”的设备读取：为 true 时 Read 不观察 ctx，
+// 必须等满延迟才返回。此时执行器只能先给出超时/取消结论，资源收尾随后完成。
+func (s *Sensor) SetIgnoreContext(ignore bool) { s.mu.Lock(); s.ignoreCtx = ignore; s.mu.Unlock() }
+
 // InFlight 返回当前尚未返回的读取调用数，用于断言资源已收尾。
 func (s *Sensor) InFlight() int { return int(atomic.LoadInt32(&s.inFlight)) }
 
@@ -66,10 +73,10 @@ func (s *Sensor) Stats() (reads int64, opened int64, closed int64) {
 	return s.total, s.opened, s.closed
 }
 
-func (s *Sensor) snapshot() (missing, fault bool, value float64, delay time.Duration) {
+func (s *Sensor) snapshot() (missing, fault, ignoreCtx bool, value float64, delay time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.missing, s.fault, s.value, s.delay
+	return s.missing, s.fault, s.ignoreCtx, s.value, s.delay
 }
 
 // acquire 模拟获取传感器句柄（串口/通道），与 release 配对统计收尾。
@@ -98,17 +105,21 @@ func (s *Sensor) Read(ctx context.Context) (float64, error) {
 	s.total++
 	s.mu.Unlock()
 
-	missing, fault, value, delay := s.snapshot()
+	missing, fault, ignoreCtx, value, delay := s.snapshot()
 	if missing {
 		return 0, fmt.Errorf("%w: %s", ErrSensorMissing, s.name)
 	}
 	if delay > 0 {
 		t := time.NewTimer(delay)
 		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-t.C:
+		if ignoreCtx {
+			<-t.C // 取消无响应：不理会 ctx，延迟自然结束才返回
+		} else {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-t.C:
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {

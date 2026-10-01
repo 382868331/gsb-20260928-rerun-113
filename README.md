@@ -14,6 +14,7 @@ go run ./cmd/devicecheck [missing|slow|range|all]
 
 - `missing`：电源传感器不存在 → 安装恢复 → 只重跑 `power` 及其下游。
 - `slow`：温度慢响应超时、100ms 后外部取消、恢复后只重跑 `temperature` 及下游，并校验资源收尾。
+- `stuck`：温度读取对取消无响应 —— 超时结论先行给出并标记 `CleanupPending`，清理进展经 `InFlight` 单独展示；无关设备照常自检；同一设备重跑等待旧读取收尾，不与在途读取重叠。
 - `range`：读数越界（`failed/out_of_range`）与读取自身报错（`error/read_error`）的区别，以及恢复。
 
 ## 结论语义（三类失败严格分开）
@@ -36,6 +37,8 @@ go run ./cmd/devicecheck [missing|slow|range|all]
 - 每个检查项使用独立的 `context.WithTimeout`；超时或取消与检查返回同时发生时，以 ctx 结论为准。
 - 检查函数内 panic 会被兜底为 `error/check_panic`，不会炸掉整个执行器。
 - 慢响应/取消要求检查函数尊重传入的 `ctx`；虚拟传感器在 `ctx.Done()` 后立即退出并释放句柄，`Device.Close()` 断言“在途读取=0、open==close”。
+- 超时/取消结论与资源收尾是两个阶段：若读取未随 ctx 退出（如无响应设备），记录会标记 `CleanupPending`，执行器通过 `InFlight()` 暴露清理进展、`WaitIdle(ctx)` 等待收尾；在此之前不得宣称资源已释放，`Device.Close()` 也会如实报错。
+- 同一检查的前次读取尚未收回时，重跑会先等其收尾再发起新读取，新旧读取绝不重叠；迟到结果只清理自己的登记，不改写任何已有记录。虚拟传感器可用 `SetIgnoreContext(true)` 模拟取消无响应。
 
 ## 重跑与历史
 

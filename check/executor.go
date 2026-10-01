@@ -3,6 +3,7 @@ package check
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -21,6 +22,9 @@ type Executor struct {
 	mu      sync.RWMutex
 	records map[string]Record
 	attempt map[string]int
+	// inflight 记录“结论已出但读取尚未收回”的检查项（如超时后仍无响应的读取），
+	// 用于：1) 向外界暴露清理进展；2) 同一检查重跑前等待旧读取收尾，避免重叠。
+	inflight map[string]chan struct{}
 }
 
 // NewExecutor 为某台设备及其型号检查集构建执行器。
@@ -50,7 +54,44 @@ func NewExecutor(device Device, set *CheckSet, history *History) (*Executor, err
 		history:    history,
 		records:    map[string]Record{},
 		attempt:    map[string]int{},
+		inflight:   map[string]chan struct{}{},
 	}, nil
+}
+
+// InFlight 返回结论已出但底层读取尚未收回的检查项（按 ID 排序）。
+// 非空即表示对应资源尚未完全收尾，不能宣称自检已彻底结束。
+func (e *Executor) InFlight() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	ids := make([]string, 0, len(e.inflight))
+	for id := range e.inflight {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// WaitIdle 阻塞等待全部在途读取收尾（或 ctx 结束）。
+// 超时/取消轮次之后、关闭设备或宣告资源已释放之前应调用它。
+func (e *Executor) WaitIdle(ctx context.Context) error {
+	for {
+		e.mu.RLock()
+		dones := make([]chan struct{}, 0, len(e.inflight))
+		for _, done := range e.inflight {
+			dones = append(dones, done)
+		}
+		e.mu.RUnlock()
+		if len(dones) == 0 {
+			return nil
+		}
+		for _, done := range dones {
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
 }
 
 // RunAll 在给定 ctx 下执行整轮自检；ctx 取消时后续项记为 canceled。
@@ -144,9 +185,29 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		if limit <= 0 {
 			limit = DefaultTimeout
 		}
+
+		// 同一检查的前次读取可能尚未收回（如超时后仍无响应）：
+		// 先等它收尾再发起新读取，避免新旧读取在同一设备上重叠。
+		if done := e.inflightDone(id); done != nil {
+			select {
+			case <-done:
+			case <-parent.Done():
+				rec.EndedAt = time.Now()
+				rec.Status, rec.Code, rec.Message = fromContextErr(parent.Err())
+				rec.Message += "（等待前次读取收尾期间被取消）"
+				e.store(rec, roots[id])
+				newRecords = append(newRecords, rec)
+				continue
+			}
+		}
+
 		itemCtx, cancelItem := context.WithTimeout(parent, limit)
 		resCh := make(chan Result, 1)
+		done := make(chan struct{})
+		e.trackInflight(id, done)
 		go func() {
+			defer e.untrackInflight(id, done)
+			defer close(done)
 			defer func() {
 				if r := recover(); r != nil {
 					resCh <- Fault("check_panic", "检查自身异常: %v", r)
@@ -169,6 +230,12 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 		case <-itemCtx.Done():
 			rec.EndedAt = time.Now()
 			rec.Status, rec.Code, rec.Message = fromContextErr(itemCtx.Err())
+			// 结论已出，但读取可能尚未收回：如实标记，不得报告为完全结束。
+			select {
+			case <-done:
+			default:
+				rec.CleanupPending = true
+			}
 		}
 		cancelItem()
 		e.store(rec, roots[id])
@@ -224,6 +291,28 @@ func (e *Executor) store(rec Record, isRoot bool) {
 	e.attempt[rec.CheckID]++
 	rec.Attempt = e.attempt[rec.CheckID]
 	e.records[rec.CheckID] = rec
+}
+
+// inflightDone 返回某检查项尚未收回的前次读取的完成信号；无则返回 nil。
+func (e *Executor) inflightDone(id string) chan struct{} {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.inflight[id]
+}
+
+func (e *Executor) trackInflight(id string, done chan struct{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.inflight[id] = done
+}
+
+func (e *Executor) untrackInflight(id string, done chan struct{}) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// 迟到结果只清理自己的登记，不触碰已有结论，避免污染后续自检。
+	if cur, ok := e.inflight[id]; ok && cur == done {
+		delete(e.inflight, id)
+	}
 }
 
 func fromContextErr(err error) (Status, string, string) {

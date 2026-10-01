@@ -13,6 +13,10 @@ type Record struct {
 	StartedAt time.Time
 	EndedAt   time.Time
 	Attempt   int
+	// CleanupPending 为 true 表示检查结论已出（如超时/取消），
+	// 但其底层读取尚未收回，不能视为“完全结束”。
+	// 可通过 Executor.InFlight / WaitIdle 观察与等待收尾进展。
+	CleanupPending bool
 }
 
 func (r Record) Duration() time.Duration { return r.EndedAt.Sub(r.StartedAt) }
@@ -45,4 +49,15 @@ func (r *Report) Record(id string) (Record, bool) {
 		}
 	}
 	return Record{}, false
+}
+
+// PendingCleanup 返回本轮结论已出但资源尚未收回的检查项。
+func (r *Report) PendingCleanup() []string {
+	var ids []string
+	for _, rec := range r.Records {
+		if rec.CleanupPending {
+			ids = append(ids, rec.CheckID)
+		}
+	}
+	return ids
 }

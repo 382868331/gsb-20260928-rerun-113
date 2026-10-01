@@ -169,6 +169,10 @@ func TestSlowSensorTimeoutReleasesResources(t *testing.T) {
 	}
 	assertRec(t, r, "temperature", check.Timeout, "timeout")
 	assertRec(t, r, "calibration", check.Blocked, "upstream_not_passed")
+	// 明确收尾边界：先等在途读取退出，再断言资源已释放。
+	if err := exec.WaitIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if n := temp.InFlight(); n != 0 {
 		t.Fatalf("超时后仍有 %d 次在途读取，资源未收尾", n)
 	}
@@ -242,6 +246,84 @@ func TestRerunDownstreamStillBlocked(t *testing.T) {
 	}
 	assertRec(t, r, "calibration", check.Blocked, "upstream_not_passed")
 	if err := dev.Close(); err != nil {
+	}
+}
+
+// 取消无响应：超时结论先行给出并标记 CleanupPending；重跑等待旧读取收尾，
+// 不与在途读取重叠；迟到结果不污染后续记录；历史批次各自独立。
+func TestStuckReadCleanupBoundary(t *testing.T) {
+	power := virtual.NewSensor("power", 12, 11, 13)
+	temp := virtual.NewSensor("temp", 25, 10, 40)
+	temp.SetDelay(800 * time.Millisecond) // 超过检查项 500ms 时限
+	temp.SetIgnoreContext(true)           // 读取不响应取消
+	calib := virtual.NewSensor("calib", .2, 0, 1)
+	dev := healthyDevice("d", power, temp, calib)
+	exec := buildExec(t, dev, nil)
+
+	start := time.Now()
+	r1, err := exec.RunAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 1200*time.Millisecond {
+		t.Fatal("无响应读取不应拖住整轮结论")
+	}
+	assertRec(t, r1, "temperature", check.Timeout, "timeout")
+	assertRec(t, r1, "calibration", check.Blocked, "upstream_not_passed")
+	rec, _ := r1.Record("temperature")
+	if !rec.CleanupPending {
+		t.Fatal("读取未收回时必须标记 CleanupPending")
+	}
+	if got := exec.InFlight(); len(got) != 1 || got[0] != "temperature" {
+		t.Fatalf("在途清理进展期望 [temperature]，得到 %v", got)
+	}
+	if err := dev.Close(); err == nil {
+		t.Fatal("读取仍在途，Close 不应报告全部收尾")
+	}
+
+	// 修复后立刻重跑：旧读取仍在途，重跑须等其收尾，不能重叠。
+	temp.SetIgnoreContext(false)
+	temp.SetDelay(0)
+	r2, err := exec.Rerun(context.Background(), virtual.CheckTemp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, r2, "temperature", check.Passed, "ok")
+	assertRec(t, r2, "calibration", check.Passed, "ok")
+	rec2, _ := r2.Record("temperature")
+	if rec2.CleanupPending {
+		t.Fatal("重跑通过后不应再挂收尾标记")
+	}
+	if rec2.Attempt != 2 {
+		t.Fatalf("temperature 应执行 2 次，Attempt=%d", rec2.Attempt)
+	}
+
+	// 收尾完成：无在途，句柄配对，旧读取与新读取各计一次（未丢失、未重叠）。
+	if err := exec.WaitIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := exec.InFlight(); len(got) != 0 {
+		t.Fatalf("收尾后仍有在途: %v", got)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reads, opened, closed := temp.Stats()
+	if reads != 2 || opened != 2 || closed != 2 {
+		t.Fatalf("资源使用状态不真实: reads=%d open=%d close=%d", reads, opened, closed)
+	}
+
+	// 历史独立：首轮仍是带收尾标记的超时结论，未被迟到结果污染。
+	old, ok := exec.History().Get(1)
+	if !ok {
+		t.Fatal("首轮历史丢失")
+	}
+	assertRec(t, old, "temperature", check.Timeout, "timeout")
+	if oldRec, _ := old.Record("temperature"); !oldRec.CleanupPending {
+		t.Fatal("历史批次中的 CleanupPending 标记不应被改写")
+	}
+	if exec.History().Len() != 2 {
+		t.Fatalf("历史轮数期望 2，得到 %d", exec.History().Len())
 	}
 }
 
