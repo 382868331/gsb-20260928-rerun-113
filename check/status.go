@@ -16,6 +16,8 @@ const (
 	Timeout Status = "timeout"
 	// Canceled 自检被取消，检查尚未完成。
 	Canceled Status = "canceled"
+	// Pending 检查已列入计划但尚未得出任何结论；不得当作通过跳过。
+	Pending Status = "pending"
 	// Stale 检查重跑后，旧的相关结论已过期（仅保留在历史报告中）。
 	Stale Status = "stale"
 )
@@ -28,7 +30,7 @@ func (s Status) rank() int {
 	switch s {
 	case Passed:
 		return 0
-	case Blocked, Stale:
+	case Blocked, Stale, Pending:
 		return 1
 	case Failed:
 		return 2

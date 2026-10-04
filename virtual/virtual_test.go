@@ -327,6 +327,84 @@ func TestStuckReadCleanupBoundary(t *testing.T) {
 	}
 }
 
+// 条件计划 + 取消无响应：温度读取无响应时超时结论先行、CleanupPending 保留；
+// 失败触发补充检查当轮执行；修复后重跑等待旧读取收尾，不与在途读取重叠。
+func TestConditionalPlanWithStuckSensor(t *testing.T) {
+	power := virtual.NewSensor("power", 12, 11, 13)
+	temp := virtual.NewSensor("temp", 25, 10, 40)
+	temp.SetDelay(800 * time.Millisecond)
+	temp.SetIgnoreContext(true)
+	calib := virtual.NewSensor("calib", .2, 0, 1)
+	diag := virtual.NewSensor("tempdiag", 1, 0, 100)
+	dev := virtual.NewDevice("d", virtual.ModelID, map[string]*virtual.Sensor{
+		"power": power, "temp": temp, "calib": calib, "tempdiag": diag,
+	})
+
+	exec := buildExec(t, dev, nil)
+	exec.OnResult(check.Rule{
+		Reason: "temperature 未通过，触发通道补充诊断",
+		When:   func(rec check.Record) bool { return rec.CheckID == "temperature" && rec.Status != check.Passed },
+		Add: func() []check.Check {
+			return []check.Check{
+				virtual.NewSensorCheck("temp_channel_diag", "温度通道诊断",
+					[]string{"power"}, 500*time.Millisecond, "tempdiag", 0, 100),
+			}
+		},
+	})
+
+	r1, err := exec.RunAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, r1, "temperature", check.Timeout, "timeout")
+	assertRec(t, r1, "calibration", check.Blocked, "upstream_not_passed")
+	assertRec(t, r1, "temp_channel_diag", check.Passed, "ok") // 补充检查当轮执行
+	rec, _ := r1.Record("temperature")
+	if !rec.CleanupPending {
+		t.Fatal("无响应读取必须保留 CleanupPending 收尾标记")
+	}
+	if got := exec.InFlight(); len(got) != 1 || got[0] != "temperature" {
+		t.Fatalf("在途清理进展期望 [temperature]，得到 %v", got)
+	}
+	item, ok := exec.Plan().Get("temp_channel_diag")
+	if !ok || item.Reason == "" {
+		t.Fatalf("计划中应可查看补充检查及其原因: %+v", item)
+	}
+
+	// 修复后重跑：旧读取仍在途，须等其收尾再发起新读取。
+	temp.SetIgnoreContext(false)
+	temp.SetDelay(0)
+	r2, err := exec.Rerun(context.Background(), virtual.CheckTemp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, r2, "temperature", check.Passed, "ok")
+	assertRec(t, r2, "calibration", check.Passed, "ok")
+	if err := exec.WaitIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reads, opened, closed := temp.Stats()
+	if reads != 2 || opened != closed {
+		t.Fatalf("旧读取未丢失、未重叠: reads=%d open=%d close=%d", reads, opened, closed)
+	}
+	// 无关分支（power）首轮结论保留，未被重测。
+	if rec := mustRec(t, r2, "power"); rec.Attempt != 1 {
+		t.Fatalf("power 不应被重测，Attempt=%d", rec.Attempt)
+	}
+}
+
+func mustRec(t *testing.T, r *check.Report, id string) check.Record {
+	t.Helper()
+	rec, ok := r.Record(id)
+	if !ok {
+		t.Fatalf("报告缺少 %q", id)
+	}
+	return rec
+}
+
 func assertRec(t *testing.T, r *check.Report, id string, status check.Status, code string) {
 	t.Helper()
 	rec, ok := r.Record(id)

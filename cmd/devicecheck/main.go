@@ -17,6 +17,9 @@
 //	         重跑会等待旧读取收尾，不与在途读取重叠。
 //	range    温度读数越界（failed/out_of_range）与传感器恢复正常读数的对比，
 //	         演示“读数越界”与“传感器不存在/检查报错”是不同结论。
+//	cond     条件检查计划：temperature 失败触发补充诊断（可查看的计划），
+//	         修复后仅重测受影响部分，上游再变时指出过期下游结论；
+//	         计划保存到文件后重开，历史结论与新发现项互不覆盖。
 //	all      依次演示上述场景。
 package main
 
@@ -33,7 +36,7 @@ import (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|all]")
+		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|cond|all]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -50,13 +53,16 @@ func main() {
 		runStuck()
 	case "range":
 		runRange()
+	case "cond":
+		runCond()
 	case "all":
 		runMissing()
 		runSlow()
 		runStuck()
 		runRange()
+		runCond()
 	default:
-		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|all）\n", scene)
+		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|cond|all）\n", scene)
 		os.Exit(2)
 	}
 }
@@ -73,8 +79,11 @@ func printReport(title string, r *check.Report) {
 		fmt.Println(line)
 	}
 	c := r.Counts()
-	fmt.Printf("计数: passed=%d failed=%d error=%d blocked=%d timeout=%d canceled=%d\n",
-		c[check.Passed], c[check.Failed], c[check.Error], c[check.Blocked], c[check.Timeout], c[check.Canceled])
+	fmt.Printf("计数: passed=%d failed=%d error=%d blocked=%d timeout=%d canceled=%d pending=%d\n",
+		c[check.Passed], c[check.Failed], c[check.Error], c[check.Blocked], c[check.Timeout], c[check.Canceled], c[check.Pending])
+	if len(r.Invalidated) > 0 {
+		fmt.Printf("过期：本轮上游变化使以下下游结论失效: %v\n", r.Invalidated)
+	}
 	if ids := r.PendingCleanup(); len(ids) > 0 {
 		fmt.Printf("注意：%v 结论已出但读取尚未收回，资源收尾仍在进行\n", ids)
 	}
