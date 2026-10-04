@@ -9,13 +9,14 @@ go build ./...
 go test -race ./...
 
 # 可运行演示（虚拟设备），默认 all 依次演示三个场景
-go run ./cmd/devicecheck [missing|slow|range|all]
+go run ./cmd/devicecheck [missing|slow|stuck|range|cond|all]
 ```
 
 - `missing`：电源传感器不存在 → 安装恢复 → 只重跑 `power` 及其下游。
 - `slow`：温度慢响应超时、100ms 后外部取消、恢复后只重跑 `temperature` 及下游，并校验资源收尾。
 - `stuck`：温度读取对取消无响应 —— 超时结论先行给出并标记 `CleanupPending`，清理进展经 `InFlight` 单独展示；无关设备照常自检；同一设备重跑等待旧读取收尾，不与在途读取重叠。
 - `range`：读数越界（`failed/out_of_range`）与读取自身报错（`error/read_error`）的区别，以及恢复。
+- `cond`：条件计划 —— `temperature` 越界触发补充检查 `temp_probe` 加入计划并同轮执行；计划历史保存重开后可对比差别；修复后只重跑受影响项，未重跑项旧结论被明确标记失效。
 
 ## 结论语义（三类失败严格分开）
 
@@ -45,6 +46,13 @@ go run ./cmd/devicecheck [missing|slow|range|all]
 - `Executor.Affected(id)` 返回重跑范围：`id` 自身 + 依赖链上所有受影响下游（拓扑序）。
 - `Executor.Rerun(ctx, id)` 只执行上述范围；范围外的既有结论原样保留（`Attempt` 不增加）。上游仍未通过时，下游重跑依旧是 `blocked`。
 - 每次 `RunAll`/`Rerun` 都生成一个新的不可变 `Report` 追加到 `History`，旧批次不被改写。可通过 `History.Get(runID)`（从 1 开始）或 `History.Latest()` 取回。
+- 上游结论发生变化时，其下游（含条件补充项的依据依赖）既有结论即被标记失效：`Executor.Invalidated()` 给出失效项与原因，当轮 `Report.Stale` 同步列出；失效只是“不可再信”的标记，历史记录不被改写，对应项重跑后标记自动清除。
+
+## 条件计划
+
+- `Executor.SetRules(rules...)` 注册条件规则：`Rule{Trigger, Status, Code, Adds, Reason}` 表示“当 Trigger 检查得出匹配结论时，把 Adds 中的补充检查追加进计划”。规则在每次执行后评估，新项纳入同一轮继续执行，直到没有新项为止。
+- 每个加入计划的项都记录 `Reason`（加入原因）与 `Evidence`（加入瞬间触发项及其前置检查的结论快照），见 `PlanItem`。
+- 计划历史由 `PlanLog` 追加保存：初始检查集为版本 1，每次调整生成新版本，旧版本永不改写；`PlanLog.Save/LoadPlanLog` 支持 JSON 持久化，保存并重新打开后可用 `DiffPlans(vOld, vNew)` 解释当前计划与任一历史计划的差别（含每项加入原因与当时依据）。
 
 ## 代码结构
 

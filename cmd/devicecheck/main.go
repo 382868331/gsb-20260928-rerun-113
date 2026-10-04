@@ -17,6 +17,9 @@
 //	         重跑会等待旧读取收尾，不与在途读取重叠。
 //	range    温度读数越界（failed/out_of_range）与传感器恢复正常读数的对比，
 //	         演示“读数越界”与“传感器不存在/检查报错”是不同结论。
+//	cond     条件计划：temperature 越界触发补充检查加入计划，记录加入原因与
+//	         当时依据；计划历史保存重开后可对比；修复后只重跑受影响项，
+//	         未重跑项的旧结论被明确标记失效。
 //	all      依次演示上述场景。
 package main
 
@@ -33,7 +36,7 @@ import (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|all]")
+		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|cond|all]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -50,13 +53,16 @@ func main() {
 		runStuck()
 	case "range":
 		runRange()
+	case "cond":
+		runCond()
 	case "all":
 		runMissing()
 		runSlow()
 		runStuck()
 		runRange()
+		runCond()
 	default:
-		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|all）\n", scene)
+		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|cond|all）\n", scene)
 		os.Exit(2)
 	}
 }

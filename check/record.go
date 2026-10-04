@@ -30,6 +30,9 @@ type Report struct {
 	EndedAt   time.Time
 	Overall   Status
 	Records   []Record
+	// Stale 列出本批次生成时已失效（上游结论已变化）但尚未重跑的检查项，
+	// 其 Records 中的旧结论不可再信；明细原因见 Executor.Invalidated。
+	Stale []string
 }
 
 // Counts 汇总本轮报告中各状态的检查项数量。

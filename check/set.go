@@ -57,9 +57,19 @@ func (s *CheckSet) IDs() []string {
 // Order 返回满足依赖先后关系的执行顺序（Kahn 拓扑排序）。
 // 依赖图成环时返回错误。
 func (s *CheckSet) Order() ([]string, error) {
-	indegree := make(map[string]int, len(s.checks))
-	dependents := make(map[string][]string, len(s.checks))
-	for id, item := range s.checks {
+	order, _, err := topoOrder(s.checks)
+	if err != nil {
+		return nil, &ErrCheckSet{msg: fmt.Sprintf("型号 %q 的检查依赖存在环", s.Model)}
+	}
+	return order, err
+}
+
+// topoOrder 对给定检查表做 Kahn 拓扑排序，同时返回每个检查的直接下游表。
+// 依赖图成环时返回错误。
+func topoOrder(checks map[string]Check) ([]string, map[string][]string, error) {
+	indegree := make(map[string]int, len(checks))
+	dependents := make(map[string][]string, len(checks))
+	for id, item := range checks {
 		indegree[id] = len(item.Deps())
 		for _, dep := range item.Deps() {
 			dependents[dep] = append(dependents[dep], id)
@@ -72,7 +82,7 @@ func (s *CheckSet) Order() ([]string, error) {
 		}
 	}
 	sort.Strings(ready)
-	order := make([]string, 0, len(s.checks))
+	order := make([]string, 0, len(checks))
 	for len(ready) > 0 {
 		id := ready[0]
 		ready = ready[1:]
@@ -87,8 +97,8 @@ func (s *CheckSet) Order() ([]string, error) {
 			}
 		}
 	}
-	if len(order) != len(s.checks) {
-		return nil, &ErrCheckSet{msg: fmt.Sprintf("型号 %q 的检查依赖存在环", s.Model)}
+	if len(order) != len(checks) {
+		return nil, nil, &ErrCheckSet{msg: "检查依赖存在环"}
 	}
-	return order, nil
+	return order, dependents, nil
 }

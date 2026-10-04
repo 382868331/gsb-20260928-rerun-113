@@ -18,6 +18,9 @@ const (
 	CheckCalib = "calibration"
 )
 
+// CheckTempProbe 是 temperature 未通过时由条件规则追加的补充检查 ID。
+const CheckTempProbe = "temp_probe"
+
 // SensorCheck 把一次虚拟传感器读数封装成一个 check.Check。
 // 三类失败严格区分：
 //   - 传感器不存在 → Error / sensor_missing；
@@ -69,6 +72,22 @@ func NewSet() (*check.CheckSet, error) {
 		NewSensorCheck(CheckTemp, "舱内温度检测", []string{CheckPower}, 500*time.Millisecond, "temp", 10.0, 40.0),
 		NewSensorCheck(CheckCalib, "校准一致性检查", []string{CheckTemp}, 500*time.Millisecond, "calib", 0.0, 1.0),
 	)
+}
+
+// CondRules 返回演示用的条件计划规则：
+// temperature 一旦未通过（越界/故障/超时等），即追加“温度探头深度诊断”。
+// 补充检查不声明图依赖，其触发依据完整记录在计划项的 Evidence 中，
+// 因此修复 temperature 后它不会被自动重跑，旧结论会被标记失效，
+// 由现场决定是否单独重跑。
+func CondRules() []check.Rule {
+	return []check.Rule{{
+		Trigger: CheckTemp,
+		Code:    "out_of_range",
+		Adds: []check.Check{
+			NewSensorCheck(CheckTempProbe, "温度探头深度诊断", nil, 500*time.Millisecond, "probe", 0.0, 100.0),
+		},
+		Reason: "temperature 读数越界，追加探头深度诊断以定位探头本体或安装问题",
+	}}
 }
 
 // NewDeviceWithSensors 按场景组装演示设备。
