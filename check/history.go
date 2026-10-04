@@ -14,8 +14,17 @@ type History struct {
 func (h *History) Save(report *Report) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	report.RunID = len(h.reports) + 1
+	if report.RunID == 0 {
+		report.RunID = len(h.reports) + 1
+	}
 	h.reports = append(h.reports, report)
+}
+
+// NextRunID 返回下一轮将使用的编号。
+func (h *History) NextRunID() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.reports) + 1
 }
 
 // Latest 返回最近一轮报告。

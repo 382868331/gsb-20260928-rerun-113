@@ -46,6 +46,17 @@ go run ./cmd/devicecheck [missing|slow|range|all]
 - `Executor.Rerun(ctx, id)` 只执行上述范围；范围外的既有结论原样保留（`Attempt` 不增加）。上游仍未通过时，下游重跑依旧是 `blocked`。
 - 每次 `RunAll`/`Rerun` 都生成一个新的不可变 `Report` 追加到 `History`，旧批次不被改写。可通过 `History.Get(runID)`（从 1 开始）或 `History.Latest()` 取回。
 
+## 条件计划与持久化
+
+- 基础检查项默认进入计划；`ConditionalCheck` 包装的补充项不执行，直到 `ConditionalRule` 匹配某个现场结果。
+- 每个计划项记录加入来源（基础/条件/重跑）、原因、加入时的结果证据（检查 ID、轮次、尝试、状态、代码、消息）以及计划修订号。
+- 失败补充项可以依赖失败证据执行；普通依赖仍必须通过，不能借补充检查让常规下游放行。
+- 修复后重跑只执行指定项及普通静态下游；不相关通过项保持原 `Attempt` 并继续复用。
+- 触发条件消失后，旧补充检查结论在当前状态中标记为 `stale`，`Report.Invalidations` 明确列出失效原因和旧结论；历史批次仍保留当时事实。
+- 每个 `Report` 保存 `PlanBefore`/`PlanAfter`，`DiffPlans` 可解释当前计划与历史计划的差别。
+- `Executor.SaveState`/`SaveStateFile` 保存当前结论、尝试次数与计划；`History.SaveState`/`LoadState` 保存完整批次。重新打开后用 `LoadExecutorState` + `RestoreExecutor` 恢复。
+- 跨进程重启后，旧 goroutine 已无法由新进程等待：`ReadStillOpen` 保留“检查已超时但读取退出未知”的记录，但当前 `InFlight()` 不冒充仍可管理的读取。
+
 ## 代码结构
 
 - `check/`：状态、记录、检查集（拓扑排序与环检测）、执行器、历史。

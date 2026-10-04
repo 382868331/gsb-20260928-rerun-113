@@ -13,9 +13,10 @@ const ModelID = "virt-env-1000"
 
 // 检查项 ID：电源 → 温度（依赖电源）→ 校准（依赖温度）。
 const (
-	CheckPower = "power"
-	CheckTemp  = "temperature"
-	CheckCalib = "calibration"
+	CheckPower          = "power"
+	CheckPowerConnector = "power_connector"
+	CheckTemp           = "temperature"
+	CheckCalib          = "calibration"
 )
 
 // SensorCheck 把一次虚拟传感器读数封装成一个 check.Check。
@@ -64,11 +65,23 @@ func NewSensorCheck(id, name string, deps []string, timeout time.Duration, senso
 // NewSet 为演示设备构建检查集：
 // temperature 依赖 power；calibration 依赖 temperature。
 func NewSet() (*check.CheckSet, error) {
-	return check.NewSet(ModelID,
+	set, err := check.NewSet(ModelID,
 		NewSensorCheck(CheckPower, "电源电压检测", nil, 500*time.Millisecond, "power", 11.0, 13.0),
+		check.NewConditionalCheck(NewSensorCheck(CheckPowerConnector, "电源连接器补充检查", []string{CheckPower}, 500*time.Millisecond, "connector", 0.0, 2.0)),
 		NewSensorCheck(CheckTemp, "舱内温度检测", []string{CheckPower}, 500*time.Millisecond, "temp", 10.0, 40.0),
 		NewSensorCheck(CheckCalib, "校准一致性检查", []string{CheckTemp}, 500*time.Millisecond, "calib", 0.0, 1.0),
 	)
+	if err != nil {
+		return nil, err
+	}
+	err = set.RegisterConditionalRule(check.ConditionalRule{
+		From:   CheckPower,
+		Status: check.Error,
+		Code:   "sensor_missing",
+		Add:    []string{CheckPowerConnector},
+		Reason: "电源传感器缺失后，追加连接器到位检查以区分未安装与接触不良",
+	})
+	return set, err
 }
 
 // NewDeviceWithSensors 按场景组装演示设备。
@@ -83,5 +96,6 @@ func NewDeviceWithSensors(id string, power, temp, calib *Sensor) *Device {
 	if calib != nil {
 		sensors["calib"] = calib
 	}
+	sensors["connector"] = NewSensor("connector", 1.0, 0.0, 2.0)
 	return NewDevice(id, ModelID, sensors)
 }

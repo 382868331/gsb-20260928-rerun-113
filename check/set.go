@@ -12,13 +12,15 @@ func (e *ErrCheckSet) Error() string { return e.msg }
 
 // CheckSet 是某个型号提供的一组诊断项及其依赖关系。
 type CheckSet struct {
-	Model  string
-	checks map[string]Check
+	Model          string
+	checks         map[string]Check
+	conditional    map[string]bool
+	conditionRules []ConditionalRule
 }
 
 // NewSet 构建并校验一个检查集。
 func NewSet(model string, checks ...Check) (*CheckSet, error) {
-	set := &CheckSet{Model: model, checks: make(map[string]Check, len(checks))}
+	set := &CheckSet{Model: model, checks: make(map[string]Check, len(checks)), conditional: map[string]bool{}}
 	for _, item := range checks {
 		if item.ID() == "" {
 			return nil, &ErrCheckSet{msg: "检查项 ID 不能为空"}
@@ -36,6 +38,51 @@ func NewSet(model string, checks ...Check) (*CheckSet, error) {
 		}
 	}
 	return set, nil
+}
+
+// ConditionalCheck 包装一个默认不执行、由失败结果追加的补充检查。
+type ConditionalCheck struct {
+	Check
+}
+
+// NewConditionalCheck 标记一个检查项只能由条件规则加入计划。
+func NewConditionalCheck(item Check) ConditionalCheck {
+	return ConditionalCheck{Check: item}
+}
+
+// IsConditional 表明该检查由条件规则触发。
+func (ConditionalCheck) IsConditional() bool { return true }
+
+type conditionalMarker interface{ IsConditional() bool }
+
+// RegisterConditionalRule 添加失败结果触发补充检查的规则。
+func (s *CheckSet) RegisterConditionalRule(rule ConditionalRule) error {
+	if _, ok := s.Get(rule.From); !ok {
+		return &ErrCheckSet{msg: fmt.Sprintf("条件规则来源 %q 不存在", rule.From)}
+	}
+	if rule.Status == "" && rule.Code == "" && rule.Match == nil {
+		return &ErrCheckSet{msg: fmt.Sprintf("条件规则 %q 必须指定状态、代码或匹配函数", rule.From)}
+	}
+	for _, id := range rule.Add {
+		item, ok := s.Get(id)
+		if !ok {
+			return &ErrCheckSet{msg: fmt.Sprintf("条件规则追加的 %q 不存在", id)}
+		}
+		if marker, ok := item.(conditionalMarker); !ok || !marker.IsConditional() {
+			return &ErrCheckSet{msg: fmt.Sprintf("条件规则追加的 %q 必须是条件检查", id)}
+		}
+		s.conditional[id] = true
+	}
+	s.conditionRules = append(s.conditionRules, rule)
+	return nil
+}
+
+// Conditional 报告检查项是否默认不在基础计划中。
+func (s *CheckSet) Conditional(id string) bool { return s.conditional[id] }
+
+// Rules 返回条件追加规则。
+func (s *CheckSet) Rules() []ConditionalRule {
+	return append([]ConditionalRule(nil), s.conditionRules...)
 }
 
 // Get 按 ID 取检查项。

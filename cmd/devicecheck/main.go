@@ -70,6 +70,12 @@ func printReport(title string, r *check.Report) {
 		if rec.CleanupPending {
 			line += " [资源收尾中]"
 		}
+		if rec.ReadStillOpen {
+			line += " [读取仍未退出]"
+		}
+		if rec.Stale {
+			line += " [旧结论已失效]"
+		}
 		fmt.Println(line)
 	}
 	c := r.Counts()

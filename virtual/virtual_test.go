@@ -1,6 +1,7 @@
 package virtual_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -324,6 +325,134 @@ func TestStuckReadCleanupBoundary(t *testing.T) {
 	}
 	if exec.History().Len() != 2 {
 		t.Fatalf("历史轮数期望 2，得到 %d", exec.History().Len())
+	}
+}
+
+func TestFailureAppendsConditionalCheckAndRerunInvalidatesOnlyAffected(t *testing.T) {
+	power := virtual.NewSensor("power", 12, 11, 13)
+	temp := virtual.NewSensor("temp", 25, 10, 40)
+	calib := virtual.NewSensor("calib", .2, 0, 1)
+	connector := virtual.NewSensor("connector", 1, 0, 2)
+	dev := virtual.NewDevice("d", virtual.ModelID, map[string]*virtual.Sensor{
+		"temp":      temp,
+		"calib":     calib,
+		"connector": connector,
+	})
+	set, err := virtual.NewSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := &check.History{}
+	exec, err := check.NewExecutor(dev, set, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r1, err := exec.RunAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, r1, virtual.CheckPower, check.Error, "sensor_missing")
+	assertRec(t, r1, virtual.CheckPowerConnector, check.Passed, "ok")
+	assertRec(t, r1, virtual.CheckTemp, check.Blocked, "upstream_not_passed")
+	if got := len(r1.PlanAfter.Entries); got != 4 {
+		t.Fatalf("补充项加入后计划应有 4 项，得到 %d", got)
+	}
+	var entry check.PlanEntry
+	for _, candidate := range r1.PlanAfter.Entries {
+		if candidate.CheckID == virtual.CheckPowerConnector {
+			entry = candidate
+		}
+	}
+	if entry.Origin != check.PlanConditional || entry.Trigger == nil {
+		t.Fatalf("补充项缺少加入原因或触发结果: %+v", entry)
+	}
+	if entry.Trigger.CheckID != virtual.CheckPower || entry.Trigger.Code != "sensor_missing" {
+		t.Fatalf("触发证据错误: %+v", entry.Trigger)
+	}
+
+	var state bytes.Buffer
+	if err := exec.SaveState(&state); err != nil {
+		t.Fatal(err)
+	}
+	var oldReports bytes.Buffer
+	if err := history.SaveState(&oldReports); err != nil {
+		t.Fatal(err)
+	}
+	restoredHistory := &check.History{}
+	if err := restoredHistory.LoadState(bytes.NewReader(oldReports.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := check.LoadExecutorState(bytes.NewReader(state.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := check.RestoreExecutor(dev, set, restoredHistory, persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := check.DiffPlans(r1.PlanBefore, restored.CurrentPlan())
+	if len(diff.Added) != 1 || diff.Added[0].CheckID != virtual.CheckPowerConnector {
+		t.Fatalf("重开后无法解释补充项差别: %+v", diff)
+	}
+
+	dev2 := virtual.NewDevice("d", virtual.ModelID, map[string]*virtual.Sensor{
+		"power":     power,
+		"temp":      temp,
+		"calib":     calib,
+		"connector": connector,
+	})
+	restored2, err := check.RestoreExecutor(dev2, set, history, persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := restored2.Rerun(context.Background(), virtual.CheckPower)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRec(t, r2, virtual.CheckPower, check.Passed, "ok")
+	assertRec(t, r2, virtual.CheckTemp, check.Passed, "ok")
+	assertRec(t, r2, virtual.CheckCalib, check.Passed, "ok")
+	connectorRec, _ := r2.Record(virtual.CheckPowerConnector)
+	if !connectorRec.Stale || connectorRec.Attempt != 1 {
+		t.Fatalf("旧补充结论应失效且不得重跑: %+v", connectorRec)
+	}
+	found := false
+	for _, inv := range r2.Invalidations {
+		if inv.CheckID == virtual.CheckPowerConnector && inv.Because == "trigger_changed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("报告未明确指出旧补充结论失效: %+v", r2.Invalidations)
+	}
+	assertRec(t, r1, virtual.CheckPowerConnector, check.Passed, "ok")
+}
+
+func TestTimedOutCheckRecordsReadStillOpenSeparately(t *testing.T) {
+	power := virtual.NewSensor("power", 12, 11, 13)
+	temp := virtual.NewSensor("temp", 25, 10, 40)
+	temp.SetDelay(800 * time.Millisecond)
+	temp.SetIgnoreContext(true)
+	dev := virtual.NewDeviceWithSensors("d", power, temp, virtual.NewSensor("calib", .2, 0, 1))
+	exec := buildExec(t, dev, nil)
+
+	r, err := exec.RunAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := r.Record(virtual.CheckTemp)
+	if rec.Status != check.Timeout || !rec.ReadStillOpen || !rec.CleanupPending {
+		t.Fatalf("超时与读取未退出必须同时明确: %+v", rec)
+	}
+	if got := exec.InFlight(); len(got) != 1 || got[0] != virtual.CheckTemp {
+		t.Fatalf("读取仍未退出: %v", got)
+	}
+	if err := exec.WaitIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
