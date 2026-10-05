@@ -30,6 +30,12 @@ type SensorCheck struct {
 	check.FuncCheck
 }
 
+type InstrumentCheck struct {
+	*SensorCheck
+	uses     []check.InstrumentRequirement
+	estimate time.Duration
+}
+
 // NewSensorCheck 构造传感器检查。thresholdMin/Max 为业务合格区间。
 func NewSensorCheck(id, name string, deps []string, timeout time.Duration, sensor string, thresholdMin, thresholdMax float64) *SensorCheck {
 	return &SensorCheck{FuncCheck: check.FuncCheck{
@@ -63,6 +69,21 @@ func NewSensorCheck(id, name string, deps []string, timeout time.Duration, senso
 		},
 	}}
 }
+
+func NewInstrumentCheck(id, name string, deps []string, timeout time.Duration, sensor string,
+	thresholdMin, thresholdMax float64, instrumentID string, estimate time.Duration) *InstrumentCheck {
+	return &InstrumentCheck{
+		SensorCheck: NewSensorCheck(id, name, deps, timeout, sensor, thresholdMin, thresholdMax),
+		uses:        []check.InstrumentRequirement{{InstrumentID: instrumentID}},
+		estimate:    estimate,
+	}
+}
+
+func (c *InstrumentCheck) InstrumentRequirements() []check.InstrumentRequirement {
+	return append([]check.InstrumentRequirement(nil), c.uses...)
+}
+
+func (c *InstrumentCheck) EstimatedOccupancy() time.Duration { return c.estimate }
 
 // NewSet 为演示设备构建检查集：
 // temperature 依赖 power；calibration 依赖 temperature。

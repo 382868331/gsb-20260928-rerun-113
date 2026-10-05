@@ -54,9 +54,18 @@ go run ./cmd/devicecheck [missing|slow|stuck|range|cond|all]
 - 每个加入计划的项都记录 `Reason`（加入原因）与 `Evidence`（加入瞬间触发项及其前置检查的结论快照），见 `PlanItem`。
 - 计划历史由 `PlanLog` 追加保存：初始检查集为版本 1，每次调整生成新版本，旧版本永不改写；`PlanLog.Save/LoadPlanLog` 支持 JSON 持久化，保存并重新打开后可用 `DiffPlans(vOld, vNew)` 解释当前计划与任一历史计划的差别（含每项加入原因与当时依据）。
 
+## 多设备共享仪器调度
+
+- 检查项可实现可选接口 `check.ResourceCheck`，声明 `InstrumentRequirements()`（所需仪器及容量）与 `EstimatedOccupancy()`（预计占用时长）。
+- `check.NewScheduler(policy, instruments...)` 维护跨设备共享容量；`scheduler.Attach(executor, risk)` 将设备执行器纳入调度，`risk` 越大风险越高。
+- `check.PolicyHighRiskFirst` 优先放行高风险设备，同风险先到先得；`check.PolicyMinimizeWaiting` 优先预计占用更短的检查，以减少平均等待。调度事件可通过 `Scheduler.Events()` 核对。
+- 仪器租约覆盖整个检查读取生命周期：即使检查已经产生 `timeout` 结论，只要底层读取尚未退出，`Scheduler.InUse(instrumentID)` 仍会显示占用，不能把同一仪器派给其他设备。
+- 读取迟到退出时只释放它自己的租约和在途登记，不会改写原轮次报告；后续设备必须等到真实释放后才能获取。
+- 上游修复使补充项的加入依据失效时，`Executor.CancelCommitment(id)` 只取消仍在排队、尚未取得仪器的承诺；已经开始的读取不能被强行中断，已经取得的独立有效结果继续复用，历史计划版本保留，当前计划生成移除版本。
+
 ## 代码结构
 
-- `check/`：状态、记录、检查集（拓扑排序与环检测）、执行器、历史。
+- `check/`：状态、记录、检查集（拓扑排序与环检测）、执行器、条件计划、共享仪器调度、历史。
 - `virtual/`：可控虚拟设备/传感器（缺失、越界、读取报错、慢延迟）及演示检查集。
 - `cmd/devicecheck/`：可直接运行的场景化 CLI 演示。
 

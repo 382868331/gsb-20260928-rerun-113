@@ -34,6 +34,15 @@ type Executor struct {
 	// inflight 记录“结论已出但读取尚未收回”的检查项（如超时后仍无响应的读取），
 	// 用于：1) 向外界暴露清理进展；2) 同一检查重跑前等待旧读取收尾，避免重叠。
 	inflight map[string]chan struct{}
+	// commitments 记录条件规则追加、且尚未真正取得资源开始执行的检查。
+	commitments map[string]bool
+	// canceledCommitments 标记已取消、等待阻塞获取返回后从计划移除的承诺。
+	canceledCommitments map[string]bool
+	// canceledRuleCommitments 防止被取消的条件项在同轮规则评估中再次加入。
+	canceledRuleCommitments map[string]bool
+	// scheduler 管理多设备共享仪器。为 nil 时保留单设备执行器原行为。
+	scheduler *Scheduler
+	risk      int
 }
 
 // NewExecutor 为某台设备及其型号检查集构建执行器。
@@ -57,18 +66,21 @@ func NewExecutor(device Device, set *CheckSet, history *History) (*Executor, err
 		return nil, err
 	}
 	return &Executor{
-		device:       device,
-		set:          set,
-		checks:       checks,
-		order:        order,
-		dependents:   dependents,
-		history:      history,
-		planLog:      NewPlanLog(order),
-		records:      map[string]Record{},
-		attempt:      map[string]int{},
-		stale:        map[string]string{},
-		evidenceDeps: map[string][]string{},
-		inflight:     map[string]chan struct{}{},
+		device:                  device,
+		set:                     set,
+		checks:                  checks,
+		order:                   order,
+		dependents:              dependents,
+		history:                 history,
+		planLog:                 NewPlanLog(order),
+		records:                 map[string]Record{},
+		attempt:                 map[string]int{},
+		stale:                   map[string]string{},
+		evidenceDeps:            map[string][]string{},
+		inflight:                map[string]chan struct{}{},
+		commitments:             map[string]bool{},
+		canceledCommitments:     map[string]bool{},
+		canceledRuleCommitments: map[string]bool{},
 	}, nil
 }
 
@@ -138,6 +150,13 @@ func (e *Executor) InFlight() []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func (e *Executor) setScheduler(scheduler *Scheduler, risk int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.scheduler = scheduler
+	e.risk = risk
 }
 
 // WaitIdle 阻塞等待全部在途读取收尾（或 ctx 结束）。
@@ -291,11 +310,36 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 				}
 			}
 
+			lease, err := e.acquireResources(parent, item)
+			if err != nil {
+				e.mu.Lock()
+				canceledCommitment := e.canceledCommitments[id]
+				if canceledCommitment {
+					delete(e.canceledCommitments, id)
+					delete(e.commitments, id)
+					delete(e.checks, id)
+					e.rebuildLocked()
+					e.planLog.removeLocked([]string{id})
+				}
+				e.mu.Unlock()
+				if canceledCommitment {
+					continue
+				}
+				rec.EndedAt = time.Now()
+				rec.Status, rec.Code, rec.Message = fromContextErr(parent.Err())
+				rec.Message += "（等待共享仪器期间被取消）"
+				e.store(rec, roots[id])
+				newRecords = append(newRecords, rec)
+				continue
+			}
+			e.markCommitmentStarted(id)
+
 			itemCtx, cancelItem := context.WithTimeout(parent, limit)
 			resCh := make(chan Result, 1)
 			done := make(chan struct{})
 			e.trackInflight(id, done)
 			go func() {
+				defer e.releaseResources(lease)
 				defer e.untrackInflight(id, done)
 				defer close(done)
 				defer func() {
@@ -365,6 +409,26 @@ func (e *Executor) run(parent context.Context, targets []string, roots map[strin
 	return report, nil
 }
 
+func (e *Executor) acquireResources(ctx context.Context, item Check) (*resourceLease, error) {
+	e.mu.RLock()
+	scheduler := e.scheduler
+	deviceID := e.device.ID()
+	e.mu.RUnlock()
+	if scheduler == nil {
+		return &resourceLease{}, nil
+	}
+	return scheduler.acquire(ctx, deviceID, item.ID(), item)
+}
+
+func (e *Executor) releaseResources(lease *resourceLease) {
+	e.mu.RLock()
+	scheduler := e.scheduler
+	e.mu.RUnlock()
+	if scheduler != nil {
+		scheduler.release(lease)
+	}
+}
+
 // applyRules 根据当前已落记录评估条件规则，把新触发的补充检查
 // 注册进检查表、追加计划版本，并返回新加入的检查 ID（按加入顺序）。
 func (e *Executor) applyRules() []string {
@@ -379,7 +443,7 @@ func (e *Executor) applyRules() []string {
 		var items []PlanItem
 		for _, c := range rule.Adds {
 			id := c.ID()
-			if _, exists := e.checks[id]; exists {
+			if e.checkAlreadyResolved(id) {
 				continue
 			}
 			e.checks[id] = c
@@ -394,6 +458,7 @@ func (e *Executor) applyRules() []string {
 				e.evidenceDeps[ev.CheckID] = append(e.evidenceDeps[ev.CheckID], id)
 			}
 			items = append(items, PlanItem{CheckID: id, Reason: rule.Reason, Evidence: evidence})
+			e.commitments[id] = true
 			added = append(added, id)
 		}
 		if len(items) > 0 {
@@ -402,6 +467,11 @@ func (e *Executor) applyRules() []string {
 		}
 	}
 	return added
+}
+
+func (e *Executor) checkAlreadyResolved(id string) bool {
+	_, inPlan := e.checks[id]
+	return inPlan || e.canceledRuleCommitments[id]
 }
 
 // rebuildLocked 在检查表变化后重算拓扑顺序与下游表，调用方须已持有写锁。
@@ -447,8 +517,17 @@ func (e *Executor) blockedBy(deps []string) (string, upstreamInfo) {
 
 func (e *Executor) store(rec Record, isRoot bool) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	_ = isRoot
+	if e.canceledCommitments[rec.CheckID] {
+		delete(e.canceledCommitments, rec.CheckID)
+		delete(e.canceledRuleCommitments, rec.CheckID)
+		delete(e.commitments, rec.CheckID)
+		delete(e.checks, rec.CheckID)
+		e.rebuildLocked()
+		e.planLog.removeLocked([]string{rec.CheckID})
+		e.mu.Unlock()
+		return
+	}
 	old, existed := e.records[rec.CheckID]
 	e.attempt[rec.CheckID]++
 	rec.Attempt = e.attempt[rec.CheckID]
@@ -457,19 +536,67 @@ func (e *Executor) store(rec Record, isRoot bool) {
 	delete(e.stale, rec.CheckID)
 	// 上游结论发生变化：其下游既有结论全部失效，直到被重新执行。
 	// 失效只是“不可再信”的标记，不改写任何历史记录。
+	var pendingCancellations []string
 	if existed && (old.Status != rec.Status || old.Code != rec.Code) {
-		reason := fmt.Sprintf("上游 %q 结论由 %s/%s 变为 %s/%s",
-			rec.CheckID, old.Status, old.Code, rec.Status, rec.Code)
 		affected := append(e.descendantsLocked(rec.CheckID), e.evidenceDeps[rec.CheckID]...)
 		for _, id := range affected {
 			if id == rec.CheckID {
 				continue
 			}
+			if e.commitments[id] {
+				e.canceledCommitments[id] = true
+				e.canceledRuleCommitments[id] = true
+				pendingCancellations = append(pendingCancellations, id)
+				continue
+			}
+			if current, ok := e.records[id]; ok && current.Status == Passed {
+				continue
+			}
 			if _, ok := e.records[id]; ok {
-				e.stale[id] = reason
+				e.stale[id] = fmt.Sprintf("上游 %q 结论由 %s/%s 变为 %s/%s",
+					rec.CheckID, old.Status, old.Code, rec.Status, rec.Code)
 			}
 		}
 	}
+	deviceID := e.device.ID()
+	scheduler := e.scheduler
+	e.mu.Unlock()
+	for _, id := range pendingCancellations {
+		if scheduler != nil {
+			scheduler.CancelWaiting(deviceID, id)
+		}
+	}
+}
+
+func (e *Executor) markCommitmentStarted(id string) {
+	e.mu.Lock()
+	delete(e.commitments, id)
+	e.mu.Unlock()
+}
+
+// CancelCommitment 取消尚未取得共享资源、尚未开始的条件补充承诺。
+// 已经占用仪器或已有独立结论的检查不会被回滚。
+func (e *Executor) CancelCommitment(id string) bool {
+	e.mu.Lock()
+	if !e.commitments[id] {
+		e.mu.Unlock()
+		return false
+	}
+	deviceID := e.device.ID()
+	scheduler := e.scheduler
+	e.mu.Unlock()
+	cancelled := scheduler == nil
+	if scheduler != nil {
+		cancelled = scheduler.CancelWaiting(deviceID, id)
+	}
+	if !cancelled {
+		return false
+	}
+	e.mu.Lock()
+	e.canceledCommitments[id] = true
+	e.canceledRuleCommitments[id] = true
+	e.mu.Unlock()
+	return true
 }
 
 // inflightDone 返回某检查项尚未收回的前次读取的完成信号；无则返回 nil。

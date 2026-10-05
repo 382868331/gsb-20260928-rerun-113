@@ -119,6 +119,31 @@ func (l *PlanLog) appendLocked(items []PlanItem) *Plan {
 	return snap
 }
 
+// removeLocked 从当前计划移除尚未开始的承诺并生成新版本；历史版本保持不变。
+func (l *PlanLog) removeLocked(ids []string) *Plan {
+	removed := map[string]bool{}
+	for _, id := range ids {
+		removed[id] = true
+	}
+	kept := make([]string, 0, len(l.order))
+	for _, id := range l.order {
+		if !removed[id] {
+			kept = append(kept, id)
+		}
+	}
+	l.order = kept
+	for _, id := range ids {
+		delete(l.items, id)
+	}
+	version := len(l.plans) + 1
+	snap := &Plan{Version: version, Items: make([]PlanItem, 0, len(l.order))}
+	for _, id := range l.order {
+		snap.Items = append(snap.Items, l.items[id])
+	}
+	l.plans = append(l.plans, snap)
+	return snap
+}
+
 // Current 返回当前（最新）计划版本。
 func (l *PlanLog) Current() *Plan {
 	l.mu.RLock()

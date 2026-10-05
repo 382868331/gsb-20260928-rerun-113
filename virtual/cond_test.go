@@ -70,8 +70,8 @@ func TestConditionalPlanAndInvalidation(t *testing.T) {
 	}
 
 	// 修复设备：只重跑 temperature 及受影响下游。
-	// power 的通过结论复用（Attempt 不增加）；probe 与 temperature 无图依赖，
-	// 不在重跑范围内，其旧结论必须被明确标记失效。
+	// power 与 probe 的通过结论都可独立复用：上游修复只取消尚未开始的承诺，
+	// 不回滚已经取得的独立有效结果。
 	temp.SetValue(25)
 	r2, err := exec.Rerun(context.Background(), virtual.CheckTemp)
 	if err != nil {
@@ -87,18 +87,14 @@ func TestConditionalPlanAndInvalidation(t *testing.T) {
 	if pr.Attempt != 1 {
 		t.Fatalf("probe 不在受影响范围内，不应重跑，Attempt=%d", pr.Attempt)
 	}
-	inv := exec.Invalidated()
-	if len(inv) != 1 || inv[0].CheckID != virtual.CheckTempProbe {
-		t.Fatalf("probe 旧结论应被标记失效: %+v", inv)
+	if got := exec.Invalidated(); len(got) != 0 {
+		t.Fatalf("有效独立结果应继续复用，不应失效: %+v", got)
 	}
-	if !strings.Contains(inv[0].Reason, "temperature") || !strings.Contains(inv[0].Reason, "failed") {
-		t.Fatalf("失效原因应说明上游结论变化: %s", inv[0].Reason)
-	}
-	if len(r2.Stale) != 1 || r2.Stale[0] != virtual.CheckTempProbe {
-		t.Fatalf("报告应列出失效项: %v", r2.Stale)
+	if len(r2.Stale) != 0 {
+		t.Fatalf("报告不应列出失效项: %v", r2.Stale)
 	}
 
-	// 单独重跑 probe 后失效标记清除；历史批次不被改写。
+	// 再次重跑 temperature 仍复用 probe：不发起新的读取。
 	r3, err := exec.Rerun(context.Background(), virtual.CheckTempProbe)
 	if err != nil {
 		t.Fatal(err)
