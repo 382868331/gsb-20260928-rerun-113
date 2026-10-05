@@ -118,9 +118,94 @@ func (e *Executor) SetRules(rules ...Rule) error {
 // 每次条件规则触发追加补充项都会生成一个新版本，旧版本永不改写。
 func (e *Executor) PlanLog() *PlanLog { return e.planLog }
 
-// Invalidated 返回当前已失效但尚未重跑的旧结论及失效原因。
-// 上游检查结果发生变化时，其下游既有结论即被标记失效，
-// 直到对应检查被重新执行为止。
+// DeviceID 返回执行器所属设备的 ID。
+func (e *Executor) DeviceID() string { return e.device.ID() }
+
+// RecordOf 返回某检查当前的最新记录；尚未执行时 ok=false。
+func (e *Executor) RecordOf(id string) (Record, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	rec, ok := e.records[id]
+	return rec, ok
+}
+
+// WaitCheckIdle 等待指定检查的在途读取收尾；无在途读取时立即返回。
+// 共享资源协调者（如仪器调度器）据此确认仪器真正空闲，
+// 超时但尚未退出的读取期间不得把资源派给他方。
+func (e *Executor) WaitCheckIdle(ctx context.Context, id string) error {
+	for {
+		e.mu.RLock()
+		done := e.inflight[id]
+		e.mu.RUnlock()
+		if done == nil {
+			return nil
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// AddChecks 由外部协调者（如共享仪器调度器）把补充检查注册进检查表：
+// 追加计划版本、记录加入原因与依据快照，并建立依据依赖 ——
+// 依据结论变化时，这些补充项的旧结论同样被标记失效。
+// 返回实际新加入的检查 ID（按加入顺序）。
+func (e *Executor) AddChecks(reason string, evidence []Evidence, checks ...Check) ([]string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	known := make(map[string]bool, len(e.checks)+len(checks))
+	for id := range e.checks {
+		known[id] = true
+	}
+	for _, c := range checks {
+		if c.ID() == "" {
+			return nil, fmt.Errorf("补充检查 ID 不能为空")
+		}
+		if known[c.ID()] {
+			return nil, fmt.Errorf("补充检查 %q 与既有检查重复", c.ID())
+		}
+		known[c.ID()] = true
+	}
+	for _, c := range checks {
+		for _, dep := range c.Deps() {
+			if !known[dep] {
+				return nil, fmt.Errorf("补充检查 %q 依赖不存在的 %q", c.ID(), dep)
+			}
+		}
+	}
+	var added []string
+	var items []PlanItem
+	for _, c := range checks {
+		id := c.ID()
+		e.checks[id] = c
+		ev := append([]Evidence(nil), evidence...)
+		seen := map[string]bool{}
+		for _, e2 := range ev {
+			seen[e2.CheckID] = true
+		}
+		// 依据为空时以各前置检查的当前结论补充快照。
+		for _, dep := range c.Deps() {
+			if rec, ok := e.records[dep]; ok && !seen[dep] {
+				ev = append(ev, evidenceOf(rec))
+				seen[dep] = true
+			}
+		}
+		for _, e2 := range ev {
+			e.evidenceDeps[e2.CheckID] = append(e.evidenceDeps[e2.CheckID], id)
+		}
+		items = append(items, PlanItem{CheckID: id, Reason: reason, Evidence: ev})
+		added = append(added, id)
+	}
+	if len(items) > 0 {
+		e.rebuildLocked()
+		e.planLog.appendLocked(items)
+	}
+	return added, nil
+}
+
+// DeviceID 返回执行器所属设备的 ID。
 func (e *Executor) Invalidated() []Invalidation {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

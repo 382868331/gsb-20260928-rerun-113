@@ -9,7 +9,7 @@ go build ./...
 go test -race ./...
 
 # 可运行演示（虚拟设备），默认 all 依次演示三个场景
-go run ./cmd/devicecheck [missing|slow|stuck|range|cond|all]
+go run ./cmd/devicecheck [missing|slow|stuck|range|cond|shared|all]
 ```
 
 - `missing`：电源传感器不存在 → 安装恢复 → 只重跑 `power` 及其下游。
@@ -17,6 +17,7 @@ go run ./cmd/devicecheck [missing|slow|stuck|range|cond|all]
 - `stuck`：温度读取对取消无响应 —— 超时结论先行给出并标记 `CleanupPending`，清理进展经 `InFlight` 单独展示；无关设备照常自检；同一设备重跑等待旧读取收尾，不与在途读取重叠。
 - `range`：读数越界（`failed/out_of_range`）与读取自身报错（`error/read_error`）的区别，以及恢复。
 - `cond`：条件计划 —— `temperature` 越界触发补充检查 `temp_probe` 加入计划并同轮执行；计划历史保存重开后可对比差别；修复后只重跑受影响项，未重跑项旧结论被明确标记失效。
+- `shared`：多设备共用仪器 —— 两台设备争用同一台 analyzer，补充检查声明所需仪器/预计占用/前置检查，调度器比较“高风险设备优先”与“减少总等待”两种安排后按选定策略兑现；超时但尚未退出的读取继续占用仪器，不当作空闲派给另一设备；上游修复仅取消尚未开始的承诺，独立有效结果继续复用。
 
 ## 结论语义（三类失败严格分开）
 
@@ -54,9 +55,17 @@ go run ./cmd/devicecheck [missing|slow|stuck|range|cond|all]
 - 每个加入计划的项都记录 `Reason`（加入原因）与 `Evidence`（加入瞬间触发项及其前置检查的结论快照），见 `PlanItem`。
 - 计划历史由 `PlanLog` 追加保存：初始检查集为版本 1，每次调整生成新版本，旧版本永不改写；`PlanLog.Save/LoadPlanLog` 支持 JSON 持久化，保存并重新打开后可用 `DiffPlans(vOld, vNew)` 解释当前计划与任一历史计划的差别（含每项加入原因与当时依据）。
 
+## 多设备共用仪器调度
+
+- 补充检查通过 `ResourceAware` 声明所需共享仪器与预计占用（`ResourceNeed{Instrument, Hold}`），“必须先完成的检查”即检查自身的 `Deps()`；各设备的补充检查由自身结果触发，经 `Scheduler.SubmitCheck` 登记为承诺（`Commitment`）。
+- `Scheduler.Compare()` 在共享容量下模拟两种安排并给出各自执行次序与总等待：`PolicyHighRiskFirst`（高风险设备优先）与 `PolicyMinTotalWait`（减少总等待，SJF）；`Scheduler.Run` 按选定策略兑现，同一设备的检查不并发，仪器并发占用不超过容量。
+- 仪器从检查开始一直占用到其底层读取真正退出（`Executor.WaitCheckIdle`）：读取超时但尚未退出时仍占用真实仪器，不会被当作空闲派给另一设备；迟到结果只归属原轮次，不改写任何已有记录。
+- 调度进行中可随时 `Submit` 动态追加承诺；`Cancel` 仅取消尚未开始的承诺，已在执行的承诺无法及时取消、继续兑现。
+- 上游修复使补充项失效时（依据依赖同样触发失效标记），仅取消尚未开始的承诺；独立有效结果继续复用（不重跑、Attempt 不增加）。`Scheduler.Events()` 提供审计日志，可核对实际执行次序与资源占用。
+
 ## 代码结构
 
-- `check/`：状态、记录、检查集（拓扑排序与环检测）、执行器、历史。
+- `check/`：状态、记录、检查集（拓扑排序与环检测）、执行器、历史、共享仪器调度器。
 - `virtual/`：可控虚拟设备/传感器（缺失、越界、读取报错、慢延迟）及演示检查集。
 - `cmd/devicecheck/`：可直接运行的场景化 CLI 演示。
 

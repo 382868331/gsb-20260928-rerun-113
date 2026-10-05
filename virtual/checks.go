@@ -104,3 +104,21 @@ func NewDeviceWithSensors(id string, power, temp, calib *Sensor) *Device {
 	}
 	return NewDevice(id, ModelID, sensors)
 }
+
+// InstrumentedCheck 在传感器检查上附加共享仪器需求声明，
+// 供多设备共用检测仪器的调度器（check.Scheduler）排队兑现。
+type InstrumentedCheck struct {
+	*SensorCheck
+	Needs []check.ResourceNeed
+}
+
+// Resources 实现 check.ResourceAware，声明所需仪器与预计占用。
+func (c *InstrumentedCheck) Resources() []check.ResourceNeed { return c.Needs }
+
+// NewInstrumentedCheck 构造一个需要共享仪器的传感器检查。
+func NewInstrumentedCheck(id, name string, deps []string, timeout time.Duration, sensor string, thresholdMin, thresholdMax float64, needs ...check.ResourceNeed) *InstrumentedCheck {
+	return &InstrumentedCheck{
+		SensorCheck: NewSensorCheck(id, name, deps, timeout, sensor, thresholdMin, thresholdMax),
+		Needs:       needs,
+	}
+}

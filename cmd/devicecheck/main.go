@@ -20,6 +20,10 @@
 //	cond     条件计划：temperature 越界触发补充检查加入计划，记录加入原因与
 //	         当时依据；计划历史保存重开后可对比；修复后只重跑受影响项，
 //	         未重跑项的旧结论被明确标记失效。
+//	shared   多设备共用仪器：两台设备争用同一台 analyzer，补充检查声明
+//	         所需仪器/预计占用/前置检查，调度器比较“高风险优先”与“减少
+//	         总等待”两种安排后兑现；超时未退出的读取继续占用仪器；上游
+//	         修复仅取消尚未开始的承诺，独立有效结果继续复用。
 //	all      依次演示上述场景。
 package main
 
@@ -36,7 +40,7 @@ import (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|cond|all]")
+		fmt.Fprintln(os.Stderr, "用法: devicecheck [missing|slow|stuck|range|cond|shared|all]")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -55,14 +59,17 @@ func main() {
 		runRange()
 	case "cond":
 		runCond()
+	case "shared":
+		runShared()
 	case "all":
 		runMissing()
 		runSlow()
 		runStuck()
 		runRange()
 		runCond()
+		runShared()
 	default:
-		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|cond|all）\n", scene)
+		fmt.Fprintf(os.Stderr, "未知场景 %q（可选 missing|slow|stuck|range|cond|shared|all）\n", scene)
 		os.Exit(2)
 	}
 }
